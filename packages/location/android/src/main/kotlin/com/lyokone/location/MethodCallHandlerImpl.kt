@@ -11,13 +11,43 @@ import io.flutter.plugin.common.MethodChannel.Result
 
 private const val METHOD_CHANNEL_NAME = "lyokone/location"
 
-internal class MethodCallHandlerImpl : MethodCallHandler {
+/**
+ * [onUse] runs on every call that reaches the service: the plugin tells the
+ * service this engine consumes the location (see FlutterLocationService.noteConsumer).
+ */
+internal class MethodCallHandlerImpl(
+    private val onUse: () -> Unit,
+) : MethodCallHandler {
     private var location: FlutterLocation? = null
     private var locationService: FlutterLocationService? = null
     private var channel: MethodChannel? = null
 
+    /**
+     * Calls that arrived before the service connected. The service binds
+     * asynchronously, so the first calls of a fresh engine (a headless one
+     * above all) can precede it; they run, in order, once it is there.
+     */
+    private val pending = mutableListOf<Pair<MethodCall, Result>>()
+    private var serviceUnavailable = false
+
     fun setLocation(location: FlutterLocation?) {
         this.location = location
+        if (location == null) return
+        val queued = pending.toList()
+        pending.clear()
+        queued.forEach { (call, result) -> onMethodCall(call, result) }
+    }
+
+    /** The service could not be bound at all: nothing will ever answer, so the waiters are told now. */
+    fun serviceUnavailable() {
+        serviceUnavailable = true
+        rejectPending()
+    }
+
+    private fun rejectPending() {
+        val queued = pending.toList()
+        pending.clear()
+        queued.forEach { (_, result) -> result.error("NO_ACTIVITY", "Location service is not available.", null) }
     }
 
     fun setLocationService(locationService: FlutterLocationService?) {
@@ -28,12 +58,25 @@ internal class MethodCallHandlerImpl : MethodCallHandler {
         call: MethodCall,
         result: Result,
     ) {
+        // Answered without the service: iOS-only switches and platform facts.
+        when (call.method) {
+            "wasLaunchedByLocationEvent", "setSignificantChangeMonitoring" -> {
+                result.success(0)
+                return
+            }
+        }
         val location = this.location
         if (location == null) {
-            result.error("NO_ACTIVITY", "Location is not attached to an activity.", null)
+            if (serviceUnavailable) {
+                result.error("NO_ACTIVITY", "Location service is not available.", null)
+            } else {
+                pending.add(call to result)
+            }
             return
         }
+        onUse()
         when (call.method) {
+            "registerHeadlessCallback" -> onRegisterHeadlessCallback(call, result)
             "changeSettings" -> onChangeSettings(call, result, location)
             "getLocation" -> onGetLocation(result, location)
             "getLastKnownLocation" -> location.getLastKnownLocation(result)
@@ -76,6 +119,25 @@ internal class MethodCallHandlerImpl : MethodCallHandler {
 
         channel.setMethodCallHandler(null)
         this.channel = null
+        rejectPending()
+    }
+
+    /**
+     * The Dart entry point the service runs on a headless engine when it
+     * outlives the app's engine; a raw `PluginUtilities` callback handle.
+     */
+    private fun onRegisterHeadlessCallback(
+        call: MethodCall,
+        result: Result,
+    ) {
+        val handle = call.argument<Number>("handle")?.toLong() ?: 0L
+        val locationService = this.locationService
+        if (handle == 0L || locationService == null) {
+            result.success(0)
+            return
+        }
+        locationService.setHeadlessCallback(handle)
+        result.success(1)
     }
 
     private fun onChangeSettings(

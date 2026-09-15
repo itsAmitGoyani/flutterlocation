@@ -2,7 +2,6 @@ package com.lyokone.location
 
 import android.Manifest
 import android.app.Activity
-import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -52,40 +51,15 @@ class FlutterLocation(
     activity: Activity?,
 ) : PluginRegistry.RequestPermissionsResultListener,
     PluginRegistry.ActivityResultListener {
+    /**
+     * The Activity while one is attached: needed only for the permission
+     * prompt, the permission rationale and the location-settings resolution
+     * dialog. Permission reads, the fused / settings clients and the
+     * providers-changed receiver work from the application context, so the
+     * location request runs with no Activity at all (a headless engine after
+     * a process kill, see [FlutterLocationService]).
+     */
     var activity: Activity? = activity
-        set(value) {
-            field = value
-            if (value != null) {
-                // Only wire up the Google Play services fused provider when GMS is
-                // actually available. On devices without GMS (Huawei, some Chinese
-                // ROMs, AOSP) touching LocationServices throws SERVICE_INVALID, so
-                // we fall back to the Android framework LocationManager instead.
-                if (isGooglePlayServicesAvailable) {
-                    mFusedLocationClient = LocationServices.getFusedLocationProviderClient(value)
-                    mSettingsClient = LocationServices.getSettingsClient(value)
-                }
-
-                createLocationCallback()
-                createLocationRequest()
-                buildLocationSettingsRequest()
-                unregisterLocationProvidersChangedReceiver()
-                ContextCompat.registerReceiver(
-                    applicationContext,
-                    locationProvidersChangedReceiver,
-                    IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION),
-                    ContextCompat.RECEIVER_NOT_EXPORTED,
-                )
-            } else {
-                stopLocationUpdates()
-                mFusedLocationClient = null
-                mSettingsClient = null
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    mMessageListener?.let { locationManager.removeNmeaListener(it) }
-                    mMessageListener = null
-                }
-                unregisterLocationProvidersChangedReceiver()
-            }
-        }
 
     private fun unregisterLocationProvidersChangedReceiver() {
         try {
@@ -233,6 +207,50 @@ class FlutterLocation(
             4 to Priority.PRIORITY_HIGH_ACCURACY,
             5 to Priority.PRIORITY_LOW_POWER,
         )
+
+    init {
+        // Only wire up the Google Play services fused provider when GMS is
+        // actually available. On devices without GMS (Huawei, some Chinese
+        // ROMs, AOSP) touching LocationServices throws SERVICE_INVALID, so
+        // we fall back to the Android framework LocationManager instead.
+        if (isGooglePlayServicesAvailable) {
+            mFusedLocationClient = LocationServices.getFusedLocationProviderClient(applicationContext)
+            mSettingsClient = LocationServices.getSettingsClient(applicationContext)
+        }
+        createLocationCallback()
+        createLocationRequest()
+        buildLocationSettingsRequest()
+        ContextCompat.registerReceiver(
+            applicationContext,
+            locationProvidersChangedReceiver,
+            IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
+
+    /** Releases what the constructor and the stream took; the service calls it from `onDestroy`. */
+    fun dispose() {
+        onConsumerGone()
+        mFusedLocationClient = null
+        mSettingsClient = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            mMessageListener?.let { locationManager.removeNmeaListener(it) }
+            mMessageListener = null
+        }
+        unregisterLocationProvidersChangedReceiver()
+    }
+
+    /**
+     * The Dart side that asked for locations is gone (its engine was
+     * destroyed): nothing pending can be delivered, so the updates stop.
+     */
+    fun onConsumerGone() {
+        stopLocationUpdates()
+        events = null
+        getLocationResults.clear()
+        result = null
+        requestServiceResult = null
+    }
 
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -506,7 +524,7 @@ class FlutterLocation(
         }
         val client = mFusedLocationClient
         if (client == null) {
-            result.error("MISSING_ACTIVITY", "Location is not attached to an activity.", null)
+            result.error("LAST_KNOWN_LOCATION_ERROR", "The fused location client is not available.", null)
             return
         }
         try {
@@ -584,19 +602,9 @@ class FlutterLocation(
 
     /** Returns the current state of the permissions needed. */
     fun checkPermissions(): Boolean {
-        val activity = this.activity
-        if (activity == null) {
-            result?.error("MISSING_ACTIVITY", "You should not checkPermissions activation outside of an activity.", null)
-            throw ActivityNotFoundException()
-        }
         // Approximate (coarse) location counts as granted: a user who only
         // allows approximate location should still receive updates (#991).
-        val fineState =
-            ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)
-        val coarseState =
-            ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_COARSE_LOCATION)
-        return fineState == PackageManager.PERMISSION_GRANTED ||
-            coarseState == PackageManager.PERMISSION_GRANTED
+        return hasFineLocationPermission() || hasCoarseLocationPermission()
     }
 
     /**
@@ -613,24 +621,17 @@ class FlutterLocation(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return checkPermissions()
         }
-        val activity = this.activity
-        if (activity == null) {
-            result?.error("MISSING_ACTIVITY", "You should not checkPermissions activation outside of an activity.", null)
-            throw ActivityNotFoundException()
-        }
-        return ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+        return ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
     }
 
     private fun hasFineLocationPermission(): Boolean {
-        val activity = this.activity ?: return false
-        return ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION) ==
+        return ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
     }
 
     private fun hasCoarseLocationPermission(): Boolean {
-        val activity = this.activity ?: return false
-        return ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+        return ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
     }
 
@@ -653,13 +654,17 @@ class FlutterLocation(
     }
 
     fun requestPermissions() {
-        val activity = this.activity
-        if (activity == null) {
-            result?.error("MISSING_ACTIVITY", "You should not requestPermissions activation outside of an activity.", null)
-            throw ActivityNotFoundException()
-        }
         if (checkPermissions()) {
             result?.success(permissionStatusCode())
+            return
+        }
+        val activity = this.activity
+        if (activity == null) {
+            // No activity can show the prompt: answer every waiter instead of
+            // throwing into the caller (a headless engine has none).
+            result?.error("MISSING_ACTIVITY", "The location permission can only be requested while an activity is attached.", null)
+            result = null
+            sendError("PERMISSION_DENIED", "Location permission is not granted and no activity can request it", null)
             return
         }
         permissionPreviouslyRequested =
@@ -698,11 +703,6 @@ class FlutterLocation(
     }
 
     fun requestService(requestServiceResult: Result) {
-        val activity = this.activity
-        if (activity == null) {
-            requestServiceResult.error("MISSING_ACTIVITY", "You should not requestService activation outside of an activity.", null)
-            throw ActivityNotFoundException()
-        }
         try {
             if (checkServiceEnabled()) {
                 requestServiceResult.success(1)
@@ -710,6 +710,11 @@ class FlutterLocation(
             }
         } catch (e: Exception) {
             requestServiceResult.error("SERVICE_STATUS_ERROR", "Location service status couldn't be determined", null)
+            return
+        }
+        val activity = this.activity
+        if (activity == null) {
+            requestServiceResult.error("MISSING_ACTIVITY", "The location service dialog can only be shown while an activity is attached.", null)
             return
         }
 
@@ -754,11 +759,6 @@ class FlutterLocation(
     }
 
     fun startRequestingLocation() {
-        val activity = this.activity
-        if (activity == null) {
-            result?.error("MISSING_ACTIVITY", "You should not requestLocation activation outside of an activity.", null)
-            throw ActivityNotFoundException()
-        }
         if (!isGooglePlayServicesAvailable) {
             // No GMS: skip the fused-provider settings check (which would throw
             // SERVICE_INVALID) and request directly from the framework providers.
@@ -767,20 +767,31 @@ class FlutterLocation(
             return
         }
         val settingsRequest = mLocationSettingsRequest ?: return
+        // Plain listeners, not activity-scoped ones: the request must work
+        // with no Activity attached (a headless engine).
         mSettingsClient?.checkLocationSettings(settingsRequest)
-            ?.addOnSuccessListener(activity) {
+            ?.addOnSuccessListener {
                 registerNmeaListener()
                 requestLocationUpdates()
             }
-            ?.addOnFailureListener(activity) { e ->
+            ?.addOnFailureListener { e ->
                 if (e is ResolvableApiException) {
                     if (e.statusCode == LocationSettingsStatusCodes.RESOLUTION_REQUIRED) {
-                        try {
-                            // Show the dialog by calling startResolutionForResult(), and check
-                            // the result in onActivityResult().
-                            e.startResolutionForResult(activity, REQUEST_CHECK_SETTINGS)
-                        } catch (sie: IntentSender.SendIntentException) {
-                            Log.i(TAG, "PendingIntent unable to execute request.")
+                        val activity = this.activity
+                        if (activity == null) {
+                            // Nothing can show the dialog. Ask anyway: whatever the
+                            // settings allow is delivered, and the providers-changed
+                            // receiver requests again when the user turns location on.
+                            registerNmeaListener()
+                            requestLocationUpdates()
+                        } else {
+                            try {
+                                // Show the dialog by calling startResolutionForResult(), and check
+                                // the result in onActivityResult().
+                                e.startResolutionForResult(activity, REQUEST_CHECK_SETTINGS)
+                            } catch (sie: IntentSender.SendIntentException) {
+                                Log.i(TAG, "PendingIntent unable to execute request.")
+                            }
                         }
                     }
                 } else if (e is ApiException &&

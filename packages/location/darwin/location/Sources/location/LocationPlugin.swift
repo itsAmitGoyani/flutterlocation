@@ -24,6 +24,13 @@ public class LocationPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, CLLo
     private var hasInit = false
     private var applicationHasLocationBackgroundMode = false
 
+    // Set when iOS launched this process for a location event
+    // (UIApplicationLaunchOptionsLocationKey). Significant-change monitoring
+    // is what relaunches a terminated app; the app reads this flag to start
+    // its background work without waiting for a UI. See
+    // application(_:didFinishLaunchingWithOptions:).
+    private var launchedForLocation = false
+
     // CoreLocation delivers a cached fix immediately when updates start; fixes
     // older than this (in seconds) are treated as stale and skipped. See
     // locationManager(_:didUpdateLocations:).
@@ -51,7 +58,36 @@ public class LocationPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, CLLo
         let instance = LocationPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
         stream.setStreamHandler(instance)
+        #if os(iOS)
+        // For the launch options: a relaunch for a location event must restart
+        // significant-change monitoring before any Dart code runs.
+        registrar.addApplicationDelegate(instance)
+        #endif
     }
+
+    #if os(iOS)
+    // MARK: - Application launch
+
+    /// iOS delivers the pending significant change only to a manager that
+    /// monitors again after the relaunch, so monitoring restarts here, at
+    /// once. `wasLaunchedByLocationEvent` lets the app tell this launch from
+    /// a user one. Both key spellings are checked: the dictionary crosses the
+    /// Objective-C bridge, where the key is a plain string.
+    public func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [AnyHashable: Any] = [:]
+    ) -> Bool {
+        let key = UIApplication.LaunchOptionsKey.location
+        if launchOptions[key] != nil || launchOptions[key.rawValue] != nil {
+            launchedForLocation = true
+            initLocation()
+            if CLLocationManager.significantLocationChangeMonitoringAvailable() {
+                clLocationManager?.startMonitoringSignificantLocationChanges()
+            }
+        }
+        return true
+    }
+    #endif
 
     private func initLocation() {
         guard !hasInit else { return }
@@ -77,6 +113,13 @@ public class LocationPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, CLLo
             onIsBackgroundModeEnabled(result: result)
         case "enableBackgroundMode":
             onEnableBackgroundMode(call, result: result)
+        case "setSignificantChangeMonitoring":
+            onSetSignificantChangeMonitoring(call, result: result)
+        case "wasLaunchedByLocationEvent":
+            result(launchedForLocation ? 1 : 0)
+        case "registerHeadlessCallback":
+            // Android only: iOS relaunches the whole app for a location event.
+            result(0)
         case "getLocation":
             onGetLocation(result: result)
         case "getLastKnownLocation":
@@ -182,6 +225,24 @@ public class LocationPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, CLLo
         }
         #endif
         result(0)
+    }
+
+    /// Significant-change monitoring is the one location service that
+    /// relaunches a terminated app (with Always). It runs beside the ordinary
+    /// updates on the same manager; a significant change arrives on the same
+    /// delegate and reaches the stream like any other fix.
+    private func onSetSignificantChangeMonitoring(_ call: FlutterMethodCall, result: FlutterResult) {
+        let enable = (call.arguments as? [String: Any])?["enable"] as? Bool ?? false
+        guard let manager = clLocationManager, CLLocationManager.significantLocationChangeMonitoringAvailable() else {
+            result(0)
+            return
+        }
+        if enable {
+            manager.startMonitoringSignificantLocationChanges()
+        } else {
+            manager.stopMonitoringSignificantLocationChanges()
+        }
+        result(enable ? 1 : 0)
     }
 
     private func onGetLocation(result: @escaping FlutterResult) {

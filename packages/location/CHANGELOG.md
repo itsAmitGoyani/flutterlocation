@@ -1,3 +1,30 @@
+## Unreleased — AutoLNK fork (`itsAmitGoyani/flutterlocation`, branch `autolnk-3.95`)
+
+### ✨ Features
+
+- **Android:** the foreground service is a started, sticky service once
+  background mode is enabled. It persists the wish, the notification options
+  and a Dart callback handle, and whenever it is in the foreground with no
+  Flutter engine to feed — after a swipe-away, a process kill (sticky
+  restart), a reboot or an app update (a boot receiver) — it runs a headless
+  engine on the registered callback so the app's location code keeps
+  running. A foreground engine that attaches while a headless one runs takes
+  over synchronously. New Dart method: `registerHeadlessEntry`.
+- **iOS:** `setSignificantChangeMonitoring` starts / stops the one location
+  service that relaunches a terminated app; on a launch for a location event
+  the plugin restarts monitoring before any Dart code runs and reports it
+  through `wasLaunchedByLocationEvent`.
+
+### 🐛 Bug fixes
+
+- **Android:** the plugin binds the service from the engine with the
+  application context, not from the Activity, and every permission read and
+  location request works with no Activity attached; only the prompt, the
+  rationale and the settings dialog still need one and answer an error
+  instead of throwing without it. Method calls and the first stream listener
+  that arrive before the service connects are queued instead of failing with
+  `NO_ACTIVITY`. A destroyed engine stops the fused updates it asked for.
+
 ## 10.0.2
 
 ### 🐛 Bug fixes

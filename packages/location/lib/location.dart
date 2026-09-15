@@ -1,8 +1,8 @@
 // Ignored since there is a bug in the coverage report tool
 // https://github.com/dart-lang/coverage/issues/339 coverage:ignore-file
-import 'dart:typed_data';
 import 'dart:ui';
 
+import 'package:flutter/services.dart';
 import 'package:location_platform_interface/location_platform_interface.dart';
 
 export 'package:location_platform_interface/location_platform_interface.dart'
@@ -222,5 +222,57 @@ class Location implements LocationPlatform {
       color: color,
       onTapBringToFront: onTapBringToFront,
     );
+  }
+  // ---------------------------------------------------------------------------
+  // Terminated state (AutoLNK fork). On the plugin's own channel, so the
+  // platform interface package stays as published.
+  // ---------------------------------------------------------------------------
+
+  static const MethodChannel _forkChannel = MethodChannel('lyokone/location');
+
+  /// Android only. Registers the top-level or static Dart function the plugin
+  /// runs on a headless engine when the started foreground service outlives
+  /// the app's Flutter engine: a swipe-away, a process kill, a reboot or an
+  /// app update while [enableBackgroundMode] is on.
+  ///
+  /// Register on every start: the handle changes with every build. Returns
+  /// false where nothing runs headless (iOS, macOS, web) and when
+  /// [entryPoint] is not a top-level or static function.
+  Future<bool> registerHeadlessEntry(Function entryPoint) async {
+    final CallbackHandle? handle = PluginUtilities.getCallbackHandle(entryPoint);
+    if (handle == null) {
+      return false;
+    }
+    return _invokeFlag(
+      'registerHeadlessCallback',
+      <String, Object?>{'handle': handle.toRawHandle()},
+    );
+  }
+
+  /// iOS only. Starts or stops significant-change monitoring, the one location
+  /// service that relaunches a terminated app (it needs Always). The plugin
+  /// restarts it by itself on a location launch. Returns false where the
+  /// service is unavailable and on other platforms.
+  Future<bool> setSignificantChangeMonitoring({required bool enable}) {
+    return _invokeFlag(
+      'setSignificantChangeMonitoring',
+      <String, Object?>{'enable': enable},
+    );
+  }
+
+  /// iOS only. True when the system launched this process for a location
+  /// event (`UIApplication.LaunchOptionsKey.location`): the app runs in the
+  /// background with no UI and should start its location work itself.
+  Future<bool> wasLaunchedByLocationEvent() {
+    return _invokeFlag('wasLaunchedByLocationEvent');
+  }
+
+  Future<bool> _invokeFlag(String method, [Map<String, Object?>? arguments]) async {
+    try {
+      final int? value = await _forkChannel.invokeMethod<int>(method, arguments);
+      return value == 1;
+    } on MissingPluginException {
+      return false;
+    }
   }
 }
