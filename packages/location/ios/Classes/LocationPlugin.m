@@ -112,7 +112,11 @@
         self.clLocationManager.allowsBackgroundLocationUpdates = enable;
       }
       if (@available(iOS 11.0, *)) {
-        self.clLocationManager.showsBackgroundLocationIndicator = enable;
+        // AutoLNK: never raise the background location indicator (the blue
+        // status bar pill, the arrow inside the Dynamic Island). iOS reads
+        // this flag only for an app with Always authorization; a While Using
+        // app gets the indicator from the system whatever the flag says.
+        self.clLocationManager.showsBackgroundLocationIndicator = NO;
       }
       result(enable ? @1 : @0);
     } else {
