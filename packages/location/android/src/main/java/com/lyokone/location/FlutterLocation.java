@@ -13,6 +13,8 @@ import android.location.LocationManager;
 import android.location.OnNmeaMessageListener;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
 import android.util.SparseArray;
@@ -59,7 +61,15 @@ public class FlutterLocation
     @TargetApi(Build.VERSION_CODES.N)
     private OnNmeaMessageListener mMessageListener;
 
-    private Double mLastMslAltitude;
+    /** Whether {@link #mMessageListener} is currently registered with the location manager. */
+    private boolean mNmeaRegistered;
+
+    /** The thread the NMEA sentences are parsed on. Never the main looper. */
+    private HandlerThread mNmeaThread;
+    private Handler mNmeaHandler;
+
+    /** Written on the NMEA thread, read on the location callback's thread. */
+    private volatile Double mLastMslAltitude;
 
     // Parameters of the request
     private long updateIntervalMilliseconds = 5000;
@@ -111,11 +121,65 @@ public class FlutterLocation
             }
             mFusedLocationClient = null;
             mSettingsClient = null;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && locationManager != null) {
-                locationManager.removeNmeaListener(mMessageListener);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                detachNmeaListener();
                 mMessageListener = null;
             }
+            stopNmeaThread();
         }
+    }
+
+    /**
+     * Registers {@link #mMessageListener} with the location manager, at most once, on the NMEA
+     * thread.
+     *
+     * <p>Upstream called {@code addNmeaListener(mMessageListener, null)} from every
+     * {@code changeSettings} and every {@code getLocation}, and removed the previous listener
+     * nowhere. Each profile change therefore left one more NMEA parser behind ON THE MAIN THREAD,
+     * and every GNSS sentence was split once per leaked listener. On a phone that shares its
+     * location the count grew for as long as the app ran, which is why the map got slower the
+     * longer a share went on. The listener is now added once, and the {@code null} handler is
+     * replaced by a background looper so the parse never reaches the main thread at all.
+     *
+     * <p>Android only. iOS has no NMEA path.
+     */
+    @TargetApi(Build.VERSION_CODES.N)
+    private void attachNmeaListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return;
+        }
+        if (mNmeaRegistered || mMessageListener == null || locationManager == null) {
+            return;
+        }
+        if (mNmeaThread == null) {
+            mNmeaThread = new HandlerThread("flutter-location-nmea");
+            mNmeaThread.start();
+            mNmeaHandler = new Handler(mNmeaThread.getLooper());
+        }
+        locationManager.addNmeaListener(mMessageListener, mNmeaHandler);
+        mNmeaRegistered = true;
+    }
+
+    /** Unregisters the NMEA listener when one is registered. Safe to call more than once. */
+    @TargetApi(Build.VERSION_CODES.N)
+    private void detachNmeaListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return;
+        }
+        if (!mNmeaRegistered || mMessageListener == null || locationManager == null) {
+            return;
+        }
+        locationManager.removeNmeaListener(mMessageListener);
+        mNmeaRegistered = false;
+    }
+
+    /** Stops the NMEA thread. Only the activity detach path calls this. */
+    private void stopNmeaThread() {
+        if (mNmeaThread != null) {
+            mNmeaThread.quitSafely();
+            mNmeaThread = null;
+        }
+        mNmeaHandler = null;
     }
 
     @Override
@@ -282,6 +346,9 @@ public class FlutterLocation
         };
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            // The old listener has to go BEFORE the field is reassigned. Once the field holds the
+            // new lambda, removeNmeaListener can never reach the old one again — that is the leak.
+            detachNmeaListener();
             mMessageListener = (message, timestamp) -> {
                 if (message.startsWith("$")) {
                     String[] tokens = message.split(",");
@@ -422,9 +489,7 @@ public class FlutterLocation
         }
         mSettingsClient.checkLocationSettings(mLocationSettingsRequest)
                 .addOnSuccessListener(activity, locationSettingsResponse -> {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        locationManager.addNmeaListener(mMessageListener, null);
-                    }
+                    attachNmeaListener();
 
                     if (mFusedLocationClient != null) {
                         mFusedLocationClient
@@ -447,9 +512,7 @@ public class FlutterLocation
                         ApiException ae = (ApiException) e;
                         int statusCode = ae.getStatusCode();
                         if (statusCode == LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE) {// This error code happens during AirPlane mode.
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                locationManager.addNmeaListener(mMessageListener, null);
-                            }
+                            attachNmeaListener();
                             mFusedLocationClient.requestLocationUpdates(mLocationRequest, mLocationCallback,
                                     Looper.myLooper());
                         } else {// This should not happen according to Android documentation but it has been
