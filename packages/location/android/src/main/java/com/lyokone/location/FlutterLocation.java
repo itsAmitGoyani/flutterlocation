@@ -324,11 +324,20 @@ public class FlutterLocation
                     loc.put("altitude", mLastMslAltitude);
                 }
 
-                loc.put("speed", (double) location.getSpeed());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // A fix without a speed, an error figure or a bearing sends
+                // none: Location returns 0 for each of those when it has
+                // none, and Dart read that 0 as a real reading — a network
+                // fix arrived as "0 m/s with no error", proof of stillness
+                // it never was, and a bearing of due north.
+                if (location.hasSpeed()) {
+                    loc.put("speed", (double) location.getSpeed());
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasSpeedAccuracy()) {
                     loc.put("speed_accuracy", (double) location.getSpeedAccuracyMetersPerSecond());
                 }
-                loc.put("heading", (double) location.getBearing());
+                if (location.hasBearing()) {
+                    loc.put("heading", (double) location.getBearing());
+                }
                 loc.put("time", (double) location.getTime());
 
                 if (getLocationResult != null) {
