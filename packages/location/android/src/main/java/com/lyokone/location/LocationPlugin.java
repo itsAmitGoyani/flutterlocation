@@ -14,7 +14,12 @@ import io.flutter.embedding.engine.plugins.activity.ActivityAware;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 
 /**
- * LocationPlugin
+ * LocationPlugin.
+ *
+ * <p>Binds the location service from the ENGINE with the application context, not from the
+ * Activity: a headless engine (one the service starts after the app's engine went) has no
+ * Activity and still needs the service. The Activity only adds what a prompt or a settings
+ * dialog needs, and marks this instance as the app's own engine ({@link #activityHosted()}).
  */
 public class LocationPlugin implements FlutterPlugin, ActivityAware {
     private static final String TAG = "LocationPlugin";
@@ -26,17 +31,52 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
     private FlutterLocationService locationService;
     @Nullable
     private ActivityPluginBinding activityBinding;
+    @Nullable
+    private Context context;
+    private boolean bound;
+    private boolean activityHosted;
+
+    /**
+     * True once this engine had an Activity: it is the app itself, not a background engine (a
+     * push handler, the location service's headless one). Stays true across a configuration
+     * change.
+     */
+    public boolean activityHosted() {
+        return activityHosted;
+    }
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-        methodCallHandler = new MethodCallHandlerImpl();
+        final Context appContext = binding.getApplicationContext();
+        context = appContext;
+        methodCallHandler = new MethodCallHandlerImpl(appContext, this::noteUse);
         methodCallHandler.startListening(binding.getBinaryMessenger());
-        streamHandlerImpl = new StreamHandlerImpl();
+        streamHandlerImpl = new StreamHandlerImpl(this::noteUse);
         streamHandlerImpl.startListening(binding.getBinaryMessenger());
+        try {
+            bound = appContext.bindService(new Intent(appContext, FlutterLocationService.class), serviceConnection, Context.BIND_AUTO_CREATE);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not bind the location service.", e);
+            bound = false;
+        }
+        if (!bound) {
+            methodCallHandler.serviceUnavailable();
+        }
     }
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        dropService();
+        if (bound) {
+            bound = false;
+            try {
+                if (context != null) {
+                    context.unbindService(serviceConnection);
+                }
+            } catch (IllegalArgumentException e) {
+                // Not bound any more -- nothing to undo.
+            }
+        }
         if (methodCallHandler != null) {
             methodCallHandler.stopListening();
             methodCallHandler = null;
@@ -45,38 +85,37 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
             streamHandlerImpl.stopListening();
             streamHandlerImpl = null;
         }
-    }
-
-    private void attachToActivity(ActivityPluginBinding binding) {
-        activityBinding = binding;
-        activityBinding.getActivity().bindService(new Intent(binding.getActivity(), FlutterLocationService.class), serviceConnection, Context.BIND_AUTO_CREATE);
-    }
-
-    private void detachActivity() {
-        dispose();
-
-        activityBinding.getActivity().unbindService(serviceConnection);
-        activityBinding = null;
+        context = null;
     }
 
     @Override
     public void onAttachedToActivity(@NonNull ActivityPluginBinding binding) {
-        this.attachToActivity(binding);
+        activityHosted = true;
+        // The app opened: a headless engine the service runs must go before
+        // this engine's Dart code runs (see FlutterLocationService.takeOverFromHeadless).
+        FlutterLocationService.takeOverFromHeadless();
+        activityBinding = binding;
+        if (locationService != null) {
+            bindActivity(locationService, binding);
+        }
     }
 
     @Override
     public void onDetachedFromActivity() {
-        this.detachActivity();
+        if (locationService != null) {
+            unbindActivity(locationService);
+        }
+        activityBinding = null;
     }
 
     @Override
     public void onDetachedFromActivityForConfigChanges() {
-        this.detachActivity();
+        onDetachedFromActivity();
     }
 
     @Override
     public void onReattachedToActivityForConfigChanges(@NonNull ActivityPluginBinding binding) {
-        this.attachToActivity(binding);
+        onAttachedToActivity(binding);
     }
 
     private final ServiceConnection serviceConnection = new ServiceConnection() {
@@ -84,7 +123,7 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
             Log.d(TAG, "Service connected: " + name);
-            if(service instanceof FlutterLocationService.LocalBinder){
+            if (service instanceof FlutterLocationService.LocalBinder) {
                 initialize(((FlutterLocationService.LocalBinder) service).getService());
             }
         }
@@ -92,38 +131,76 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
         @Override
         public void onServiceDisconnected(ComponentName name) {
             Log.d(TAG, "Service disconnected:" + name);
+            dropService();
         }
     };
 
-    private void initialize(FlutterLocationService service) {
-        locationService = service;
-
-        locationService.setActivity(activityBinding.getActivity());
-
-        activityBinding.addActivityResultListener(locationService.getLocationActivityResultListener());
-        activityBinding.addRequestPermissionsResultListener(locationService.getLocationRequestPermissionsResultListener());
-        activityBinding.addRequestPermissionsResultListener(locationService.getServiceRequestPermissionsResultListener());
-
-        methodCallHandler.setLocation(locationService.getLocation());
-        methodCallHandler.setLocationService(locationService);
-
-        streamHandlerImpl.setLocation(locationService.getLocation());
+    private void noteUse() {
+        if (locationService != null) {
+            locationService.noteConsumer(this);
+        }
     }
 
-    private void dispose() {
-        streamHandlerImpl.setLocation(null);
+    private void initialize(FlutterLocationService service) {
+        locationService = service;
+        service.bindPlugin(this);
 
-        methodCallHandler.setLocationService(null);
-        methodCallHandler.setLocation(null);
-
-        if(locationService != null){
-            activityBinding.removeRequestPermissionsResultListener(locationService.getServiceRequestPermissionsResultListener());
-            activityBinding.removeRequestPermissionsResultListener(locationService.getLocationRequestPermissionsResultListener());
-            activityBinding.removeActivityResultListener(locationService.getLocationActivityResultListener());
-
-            locationService.setActivity(null);
-
-            locationService = null;
+        // The service first, then the location: setting the location drains
+        // the calls that arrived before the bind completed, and some of them
+        // need the service.
+        if (methodCallHandler != null) {
+            methodCallHandler.setLocationService(service);
+            methodCallHandler.setLocation(service.getLocation());
         }
+        if (streamHandlerImpl != null) {
+            streamHandlerImpl.setLocation(service.getLocation());
+        }
+
+        if (activityBinding != null) {
+            bindActivity(service, activityBinding);
+        }
+    }
+
+    private void bindActivity(FlutterLocationService service, ActivityPluginBinding binding) {
+        service.setActivity(binding.getActivity());
+        if (service.getLocationActivityResultListener() != null) {
+            binding.addActivityResultListener(service.getLocationActivityResultListener());
+        }
+        if (service.getLocationRequestPermissionsResultListener() != null) {
+            binding.addRequestPermissionsResultListener(service.getLocationRequestPermissionsResultListener());
+        }
+        binding.addRequestPermissionsResultListener(service.getServiceRequestPermissionsResultListener());
+    }
+
+    private void unbindActivity(FlutterLocationService service) {
+        if (activityBinding != null) {
+            activityBinding.removeRequestPermissionsResultListener(service.getServiceRequestPermissionsResultListener());
+            if (service.getLocationRequestPermissionsResultListener() != null) {
+                activityBinding.removeRequestPermissionsResultListener(service.getLocationRequestPermissionsResultListener());
+            }
+            if (service.getLocationActivityResultListener() != null) {
+                activityBinding.removeActivityResultListener(service.getLocationActivityResultListener());
+            }
+        }
+        service.setActivity(null);
+    }
+
+    private void dropService() {
+        final FlutterLocationService service = locationService;
+        if (service == null) {
+            return;
+        }
+        unbindActivity(service);
+
+        if (streamHandlerImpl != null) {
+            streamHandlerImpl.setLocation(null);
+        }
+        if (methodCallHandler != null) {
+            methodCallHandler.setLocationService(null);
+            methodCallHandler.setLocation(null);
+        }
+
+        service.unbindPlugin(this);
+        locationService = null;
     }
 }

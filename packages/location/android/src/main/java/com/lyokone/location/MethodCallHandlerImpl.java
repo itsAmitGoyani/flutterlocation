@@ -1,11 +1,14 @@
 package com.lyokone.location;
 
+import android.content.Context;
 import android.graphics.Color;
 import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import io.flutter.plugin.common.BinaryMessenger;
@@ -14,8 +17,24 @@ import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
 
+/**
+ * The method channel. {@code onUse} runs on every call that reaches the service: the plugin
+ * tells the service this engine consumes the location (see
+ * {@code FlutterLocationService.noteConsumer}).
+ */
 final class MethodCallHandlerImpl implements MethodCallHandler {
     private static final String TAG = "MethodCallHandlerImpl";
+
+    private final Context context;
+    private final Runnable onUse;
+
+    /**
+     * Calls that arrived before the service connected. The service binds asynchronously, so the
+     * first calls of a fresh engine (a headless one above all) can precede it; they run, in
+     * order, once it is there.
+     */
+    private final List<PendingCall> pending = new ArrayList<>();
+    private boolean serviceUnavailable;
 
     private FlutterLocation location;
     private FlutterLocationService locationService;
@@ -25,16 +44,74 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
 
     private static final String METHOD_CHANNEL_NAME = "lyokone/location";
 
+    private static final class PendingCall {
+        final MethodCall call;
+        final Result result;
+
+        PendingCall(MethodCall call, Result result) {
+            this.call = call;
+            this.result = result;
+        }
+    }
+
+    MethodCallHandlerImpl(Context context, Runnable onUse) {
+        this.context = context;
+        this.onUse = onUse;
+    }
+
     void setLocation(FlutterLocation location) {
         this.location = location;
+        if (location == null) {
+            return;
+        }
+        final List<PendingCall> queued = new ArrayList<>(pending);
+        pending.clear();
+        for (PendingCall p : queued) {
+            onMethodCall(p.call, p.result);
+        }
     }
 
     void setLocationService(FlutterLocationService locationService) {
         this.locationService = locationService;
     }
 
+    /** The service could not be bound at all: nothing will ever answer, so the waiters are told now. */
+    void serviceUnavailable() {
+        serviceUnavailable = true;
+        rejectPending();
+    }
+
+    private void rejectPending() {
+        final List<PendingCall> queued = new ArrayList<>(pending);
+        pending.clear();
+        for (PendingCall p : queued) {
+            p.result.error("NO_ACTIVITY", "Location service is not available.", null);
+        }
+    }
+
     @Override
     public void onMethodCall(MethodCall call, Result result) {
+        // Answered without the service: iOS-only switches and platform facts.
+        switch (call.method) {
+            case "wasLaunchedByLocationEvent":
+            case "setRelaunchMonitoring":
+                result.success(0);
+                return;
+            case "isBackgroundPermissionGranted":
+                result.success(FlutterLocationService.hasBackgroundLocationPermission(context) ? 1 : 0);
+                return;
+            default:
+                break;
+        }
+        if (location == null) {
+            if (serviceUnavailable) {
+                result.error("NO_ACTIVITY", "Location service is not available.", null);
+            } else {
+                pending.add(new PendingCall(call, result));
+            }
+            return;
+        }
+        onUse.run();
         switch (call.method) {
             case "changeSettings":
                 onChangeSettings(call, result);
@@ -63,6 +140,9 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
             case "changeNotificationOptions":
                 onChangeNotificationOptions(call, result);
                 break;
+            case "registerHeadlessCallback":
+                onRegisterHeadlessCallback(call, result);
+                break;
             default:
                 result.notImplemented();
                 break;
@@ -87,6 +167,7 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
      * Clears this instance from listening to method calls.
      */
     void stopListening() {
+        rejectPending();
         if (channel == null) {
             Log.d(TAG, "Tried to stop listening when no MethodChannel had been initialized.");
             return;
@@ -166,9 +247,9 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         if (locationService != null && enable != null) {
             if (locationService.checkBackgroundPermissions()) {
                 if (enable) {
-                    locationService.enableBackgroundMode();
-
-                    result.success(1);
+                    // 0 when the system refused the foreground start (Android 12+
+                    // without an exemption): a plain answer, never a thrown error.
+                    result.success(locationService.enableBackgroundMode() ? 1 : 0);
                 } else {
                     locationService.disableBackgroundMode();
 
@@ -187,6 +268,21 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         } else {
             result.success(0);
         }
+    }
+
+    /**
+     * The Dart entry point the service runs on a headless engine when it outlives the app's
+     * engine; a raw {@code PluginUtilities} callback handle.
+     */
+    private void onRegisterHeadlessCallback(MethodCall call, Result result) {
+        final Number raw = call.argument("handle");
+        final long handle = raw == null ? 0L : raw.longValue();
+        if (handle == 0L || locationService == null) {
+            result.success(0);
+            return;
+        }
+        locationService.setHeadlessCallback(handle);
+        result.success(1);
     }
 
     private void onChangeNotificationOptions(MethodCall call, Result result) {

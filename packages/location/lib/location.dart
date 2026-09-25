@@ -2,6 +2,7 @@
 // https://github.com/dart-lang/coverage/issues/339 coverage:ignore-file
 import 'dart:ui';
 
+import 'package:flutter/services.dart';
 import 'package:location_platform_interface/location_platform_interface.dart';
 
 export 'package:location_platform_interface/location_platform_interface.dart'
@@ -145,5 +146,71 @@ class Location implements LocationPlatform {
       color: color,
       onTapBringToFront: onTapBringToFront,
     );
+  }
+  // ---------------------------------------------------------------------------
+  // The terminated state (AutoLNK fork). On the plugin's own channel, so the
+  // platform interface package stays as published.
+  // ---------------------------------------------------------------------------
+
+  static const MethodChannel _forkChannel = MethodChannel('lyokone/location');
+
+  /// Android only. Registers the top-level or static Dart function the plugin
+  /// runs on a headless engine when the started foreground service outlives
+  /// the app's Flutter engine: a swipe-away, a process kill, a reboot or an
+  /// app update while [enableBackgroundMode] is on.
+  ///
+  /// Register on every start: the handle changes with every build. Returns
+  /// false where nothing runs headless (iOS, macOS, web) and when
+  /// [entryPoint] is not a top-level or static function.
+  Future<bool> registerHeadlessEntry(Function entryPoint) async {
+    final CallbackHandle? handle = PluginUtilities.getCallbackHandle(entryPoint);
+    if (handle == null) {
+      return false;
+    }
+    return _invokeFlag(
+      'registerHeadlessCallback',
+      <String, Object?>{'handle': handle.toRawHandle()},
+    );
+  }
+
+  /// iOS only. Arms or disarms the three services that relaunch a terminated
+  /// app under Always: significant-change monitoring, visits monitoring and
+  /// a region "leash" around the phone. The plugin re-arms them by itself on
+  /// every launch that had them armed, and on a launch for a location event
+  /// it also starts the ordinary updates before any Dart code runs. Returns
+  /// false without Always and on other platforms.
+  Future<bool> setRelaunchMonitoring({required bool enable}) {
+    return _invokeFlag(
+      'setRelaunchMonitoring',
+      <String, Object?>{'enable': enable},
+    );
+  }
+
+  /// iOS only. True when the system launched this process for a location
+  /// event (`UIApplication.LaunchOptionsKey.location`): the app runs in the
+  /// background with no UI and should start its location work itself.
+  Future<bool> wasLaunchedByLocationEvent() {
+    return _invokeFlag('wasLaunchedByLocationEvent');
+  }
+
+  /// Whether location may be read from the background: Always on iOS,
+  /// `ACCESS_BACKGROUND_LOCATION` on Android 10+ (the fine grant below it).
+  /// Answered from the platform, so a headless engine can ask before its
+  /// service is bound.
+  Future<bool> isBackgroundPermissionGranted() {
+    return _invokeFlag('isBackgroundPermissionGranted');
+  }
+
+  Future<bool> _invokeFlag(
+    String method, [
+    Map<String, Object?>? arguments,
+  ]) async {
+    try {
+      final int? value =
+          await _forkChannel.invokeMethod<int>(method, arguments);
+      return value == 1;
+    } on MissingPluginException {
+      return false;
+    }
   }
 }

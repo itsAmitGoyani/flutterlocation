@@ -2,6 +2,9 @@
 
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application>
         <service
@@ -9,6 +12,17 @@
             android:exported="false"
             android:foregroundServiceType="location"
             android:name=".FlutterLocationService"/>
+        <!-- Restores the foreground service after a reboot or an app update
+             when background mode was wanted (FlutterLocationService.restoreIfWanted). -->
+        <receiver
+            android:enabled="true"
+            android:exported="true"
+            android:name=".FlutterLocationBootReceiver">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

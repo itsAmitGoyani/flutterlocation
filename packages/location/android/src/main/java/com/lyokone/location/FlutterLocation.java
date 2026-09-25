@@ -3,7 +3,6 @@ package com.lyokone.location;
 import android.Manifest;
 import android.annotation.TargetApi;
 import android.app.Activity;
-import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentSender;
@@ -21,6 +20,7 @@ import android.util.SparseArray;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.common.api.ApiException;
 import com.google.android.gms.common.api.ResolvableApiException;
@@ -101,32 +101,53 @@ public class FlutterLocation
         }
     };
 
+    private final Context applicationContext;
+
+    /**
+     * The fused and settings clients come from the application context, so the location request
+     * runs with no Activity at all (a headless engine after a process kill, see
+     * {@link FlutterLocationService}). The Activity is needed only for the permission prompt,
+     * the rationale and the location-settings resolution dialog.
+     */
     FlutterLocation(Context applicationContext, @Nullable Activity activity) {
+        this.applicationContext = applicationContext;
         this.activity = activity;
         this.locationManager = (LocationManager) applicationContext.getSystemService(Context.LOCATION_SERVICE);
+        mFusedLocationClient = LocationServices.getFusedLocationProviderClient(applicationContext);
+        mSettingsClient = LocationServices.getSettingsClient(applicationContext);
+
+        createLocationCallback();
+        createLocationRequest();
+        buildLocationSettingsRequest();
     }
 
+    /** The Activity while one is attached. A detach never stops the updates (a config change). */
     void setActivity(@Nullable Activity activity) {
         this.activity = activity;
-        if (this.activity != null) {
-            mFusedLocationClient = LocationServices.getFusedLocationProviderClient(activity);
-            mSettingsClient = LocationServices.getSettingsClient(activity);
+    }
 
-            createLocationCallback();
-            createLocationRequest();
-            buildLocationSettingsRequest();
-        } else {
-            if (mFusedLocationClient != null) {
-                mFusedLocationClient.removeLocationUpdates(mLocationCallback);
-            }
-            mFusedLocationClient = null;
-            mSettingsClient = null;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                detachNmeaListener();
-                mMessageListener = null;
-            }
-            stopNmeaThread();
+    /** Releases what the constructor and the stream took; the service calls it from {@code onDestroy}. */
+    void dispose() {
+        onConsumerGone();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            detachNmeaListener();
+            mMessageListener = null;
         }
+        stopNmeaThread();
+    }
+
+    /**
+     * The Dart side that asked for locations is gone (its engine was destroyed): nothing pending
+     * can be delivered, so the updates stop.
+     */
+    void onConsumerGone() {
+        if (mFusedLocationClient != null && mLocationCallback != null) {
+            mFusedLocationClient.removeLocationUpdates(mLocationCallback);
+        }
+        events = null;
+        getLocationResult = null;
+        result = null;
+        requestServiceResult = null;
     }
 
     /**
@@ -173,7 +194,7 @@ public class FlutterLocation
         mNmeaRegistered = false;
     }
 
-    /** Stops the NMEA thread. Only the activity detach path calls this. */
+    /** Stops the NMEA thread. Only {@link #dispose()} calls this. */
     private void stopNmeaThread() {
         if (mNmeaThread != null) {
             mNmeaThread.quitSafely();
@@ -400,25 +421,46 @@ public class FlutterLocation
     }
 
     /**
-     * Return the current state of the permissions needed.
+     * Return the current state of the permissions needed. Read through the application context,
+     * so it answers with no Activity attached.
      */
     public boolean checkPermissions() {
-        if (this.activity == null) {
-            result.error("MISSING_ACTIVITY", "You should not checkPermissions activation outside of an activity.", null);
-            throw new ActivityNotFoundException();
-        }
-        int locationPermissionState = ActivityCompat.checkSelfPermission(activity,
+        int locationPermissionState = ContextCompat.checkSelfPermission(applicationContext,
                 Manifest.permission.ACCESS_FINE_LOCATION);
         return locationPermissionState == PackageManager.PERMISSION_GRANTED;
     }
 
-    public void requestPermissions() {
-        if (this.activity == null) {
-            result.error("MISSING_ACTIVITY", "You should not requestPermissions activation outside of an activity.", null);
-            throw new ActivityNotFoundException();
+    /**
+     * Whether location may be read from the background: the fine grant, plus
+     * {@code ACCESS_BACKGROUND_LOCATION} on Android 10+.
+     */
+    public boolean checkBackgroundPermissions() {
+        if (!checkPermissions()) {
+            return false;
         }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return true;
+        }
+        return ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    public void requestPermissions() {
         if (checkPermissions()) {
-            result.success(1);
+            if (result != null) {
+                result.success(1);
+                result = null;
+            }
+            return;
+        }
+        if (this.activity == null) {
+            // No activity can show the prompt: answer every waiter instead of
+            // throwing into the caller (a headless engine has none).
+            if (result != null) {
+                result.error("MISSING_ACTIVITY", "The location permission can only be requested while an activity is attached.", null);
+                result = null;
+            }
+            sendError("PERMISSION_DENIED", "Location permission is not granted and no activity can request it", null);
             return;
         }
         ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
@@ -448,8 +490,8 @@ public class FlutterLocation
 
     public void requestService(final Result requestServiceResult) {
         if (this.activity == null) {
-            requestServiceResult.error("MISSING_ACTIVITY", "You should not requestService activation outside of an activity.", null);
-            throw new ActivityNotFoundException();
+            requestServiceResult.error("MISSING_ACTIVITY", "The location service dialog can only be shown while an activity is attached.", null);
+            return;
         }
         try {
             if (this.checkServiceEnabled()) {
@@ -491,24 +533,33 @@ public class FlutterLocation
                 });
     }
 
+    /**
+     * Asks the fused provider for updates. Works with no Activity attached (a headless engine):
+     * the listeners are plain ones, and a settings problem that would need the resolution
+     * dialog asks anyway, so whatever the settings allow is delivered.
+     */
     public void startRequestingLocation() {
-        if (this.activity == null) {
-            result.error("MISSING_ACTIVITY", "You should not requestLocation activation outside of an activity.", null);
-            throw new ActivityNotFoundException();
+        if (mSettingsClient == null || mFusedLocationClient == null) {
+            sendError("SERVICE_STATUS_ERROR", "The fused location client is not available.", null);
+            return;
         }
         mSettingsClient.checkLocationSettings(mLocationSettingsRequest)
-                .addOnSuccessListener(activity, locationSettingsResponse -> {
+                .addOnSuccessListener(locationSettingsResponse -> {
                     attachNmeaListener();
-
-                    if (mFusedLocationClient != null) {
-                        mFusedLocationClient
-                                .requestLocationUpdates(mLocationRequest, mLocationCallback, Looper.myLooper());
-                    }
-                }).addOnFailureListener(activity, e -> {
+                    requestLocationUpdates();
+                }).addOnFailureListener(e -> {
                     if (e instanceof ResolvableApiException) {
                         ResolvableApiException rae = (ResolvableApiException) e;
                         int statusCode = rae.getStatusCode();
                         if (statusCode == LocationSettingsStatusCodes.RESOLUTION_REQUIRED) {
+                            final Activity activity = this.activity;
+                            if (activity == null) {
+                                // Nothing can show the dialog. Ask anyway: whatever the
+                                // settings allow is delivered.
+                                attachNmeaListener();
+                                requestLocationUpdates();
+                                return;
+                            }
                             try {
                                 // Show the dialog by calling startResolutionForResult(), and check the
                                 // result in onActivityResult().
@@ -522,14 +573,21 @@ public class FlutterLocation
                         int statusCode = ae.getStatusCode();
                         if (statusCode == LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE) {// This error code happens during AirPlane mode.
                             attachNmeaListener();
-                            mFusedLocationClient.requestLocationUpdates(mLocationRequest, mLocationCallback,
-                                    Looper.myLooper());
+                            requestLocationUpdates();
                         } else {// This should not happen according to Android documentation but it has been
                             // observed on some phones.
                             sendError("UNEXPECTED_ERROR", e.getMessage(), null);
                         }
                     }
                 });
+    }
+
+    /** The main looper on purpose: a headless engine's calls have no other looper to promise. */
+    private void requestLocationUpdates() {
+        if (mFusedLocationClient == null || mLocationCallback == null) {
+            return;
+        }
+        mFusedLocationClient.requestLocationUpdates(mLocationRequest, mLocationCallback, Looper.getMainLooper());
     }
 
 }
