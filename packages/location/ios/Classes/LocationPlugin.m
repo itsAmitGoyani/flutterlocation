@@ -250,11 +250,24 @@ static const NSTimeInterval kDartWatchdogSeconds = 60.0;
       result(@0);
     } else {
       [self armRelaunchMonitoring];
+      // The spot where the app goes to sleep, when Dart knows it.
+      id lat = call.arguments[@"latitude"];
+      id lng = call.arguments[@"longitude"];
+      if ([lat isKindOfClass:[NSNumber class]] &&
+          [lng isKindOfClass:[NSNumber class]]) {
+        [self setLeashAt:CLLocationCoordinate2DMake([lat doubleValue],
+                                                    [lng doubleValue])];
+      }
       result(@1);
     }
 #else
     result(@0);
 #endif
+  } else if ([call.method isEqualToString:@"listenForWakes"] ||
+             [call.method isEqualToString:@"stopListeningForWakes"] ||
+             [call.method isEqualToString:@"requestWake"]) {
+    // Android only: iOS relaunches the whole app and streams from Dart.
+    result(@0);
   } else if ([call.method isEqualToString:@"wasLaunchedByLocationEvent"]) {
 #if TARGET_OS_IOS
     result(self.launchedForLocation ? @1 : @0);

@@ -9,9 +9,11 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import java.util.Map;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.embedding.engine.plugins.activity.ActivityAware;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
+import io.flutter.plugin.common.MethodChannel;
 
 /**
  * LocationPlugin.
@@ -49,7 +51,8 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
         final Context appContext = binding.getApplicationContext();
         context = appContext;
-        methodCallHandler = new MethodCallHandlerImpl(appContext, this::noteUse);
+        WakeHub.attach(this, appContext);
+        methodCallHandler = new MethodCallHandlerImpl(appContext, this, this::noteUse);
         methodCallHandler.startListening(binding.getBinaryMessenger());
         streamHandlerImpl = new StreamHandlerImpl(this::noteUse);
         streamHandlerImpl.startListening(binding.getBinaryMessenger());
@@ -66,6 +69,7 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        WakeHub.detach(this);
         dropService();
         if (bound) {
             bound = false;
@@ -134,6 +138,15 @@ public class LocationPlugin implements FlutterPlugin, ActivityAware {
             dropService();
         }
     };
+
+    /** Hands a system wake to this engine's Dart side ({@link WakeHub}). */
+    void deliverWake(Map<String, Object> wake, MethodChannel.Result result) {
+        if (methodCallHandler == null) {
+            result.error("NO_ENGINE", "The engine is gone.", null);
+            return;
+        }
+        methodCallHandler.invokeOnWake(wake, result);
+    }
 
     private void noteUse() {
         if (locationService != null) {

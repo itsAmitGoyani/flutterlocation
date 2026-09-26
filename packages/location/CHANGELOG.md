@@ -18,6 +18,19 @@
   the launch through `wasLaunchedByLocationEvent`. New on both platforms:
   `isBackgroundPermissionGranted`.
 
+- **Android (drive-only service):** `setRelaunchMonitoring` now arms three
+  wake sources at rest: a leash geofence that follows the phone, the activity
+  transitions (with the Motion permission) and a heartbeat alarm that Doze
+  allows. A vehicle transition, or a leash exit at car speed, starts the
+  foreground service for a drive; every other event reaches the Dart handler
+  of `setWakeHandler` through a WorkManager job, without a service and so
+  without a notification. `requestWake` asks for a wake from another isolate.
+  The boot receiver re-arms the sources after a reboot or an app update.
+  A service the system started (a drive signal, a sticky restart, a reboot)
+  answers `isBackgroundModeEnabled` as false until Dart claims it with
+  `enableBackgroundMode`, and stops itself after three minutes unclaimed;
+  a wake older than fifteen minutes is dropped.
+
 ### 🐛 Bug fixes
 
 - **Android:** the plugin binds the service from the engine with the

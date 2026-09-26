@@ -23,7 +23,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import org.json.JSONException
@@ -209,6 +208,9 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         /** The boot receiver's start: restore the foreground state and the Dart consumer. */
         const val ACTION_RESTORE = "com.lyokone.location.action.RESTORE"
 
+        /** A native drive signal ([WakeReceiver]): the foreground for the drive probe. */
+        const val ACTION_DRIVE = "com.lyokone.location.action.DRIVE"
+
         private const val PREFS_NAME = "flutter_location_prefs"
         private const val PREFS_KEY_WANTED = "background_mode_wanted"
         private const val PREFS_KEY_CALLBACK = "headless_callback_handle"
@@ -221,8 +223,12 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
          */
         private const val DART_CHECK_DELAY_MS = 5000L
 
-        @JvmStatic
-        private var headlessEngine: FlutterEngine? = null
+        /**
+         * How long a service the system started (a drive signal, a sticky
+         * restart, the boot receiver) waits for Dart to claim it before it
+         * stops itself. Dart's own drive probe holds as long.
+         */
+        private const val PROBE_WINDOW_MS = 180_000L
 
         @JvmStatic
         private var instance: FlutterLocationService? = null
@@ -241,12 +247,37 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
          */
         @JvmStatic
         fun takeOverFromHeadless() {
-            val engine = headlessEngine ?: return
-            headlessEngine = null
+            if (!HeadlessLocationEngine.isRunning) return
             Log.d(TAG, "A foreground engine attached: destroying the headless engine.")
             instance?.cancelDartCheck()
-            engine.destroy()
+            HeadlessLocationEngine.destroyNow()
         }
+
+        /**
+         * Starts the foreground service for a drive the system just signalled
+         * (a vehicle transition, a leash exit at car speed). Both events exempt
+         * the app from the Android 12+ background start restriction. A refusal
+         * answers false, and the caller falls back to a short run.
+         */
+        @JvmStatic
+        fun startForDrive(context: Context): Boolean {
+            if (!hasBackgroundLocationPermission(context)) return false
+            return try {
+                ContextCompat.startForegroundService(context, Intent(context, FlutterLocationService::class.java).setAction(ACTION_DRIVE))
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "The system refused the drive start of the foreground service.", e)
+                false
+            }
+        }
+
+        /** Whether the service of this process runs in the foreground now. */
+        @JvmStatic
+        fun isForegroundNow(): Boolean = instance?.isInForegroundMode() == true
+
+        /** The registered headless entry, or 0. */
+        @JvmStatic
+        fun callbackHandle(context: Context): Long = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getLong(PREFS_KEY_CALLBACK, 0L)
 
         /**
          * Starts the foreground service again after a reboot or an app
@@ -316,6 +347,17 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
 
     private val dartCheck = Runnable { ensureDartConsumer() }
 
+    /**
+     * The service runs for a native start that Dart has not claimed yet. Dart
+     * can reconcile before the wake that explains the start reaches it; while
+     * this is set, [backgroundModeAnswer] tells it the mode is not its own,
+     * so its release leaves the service alone. Dart claims the service when
+     * it takes the token ([claimForDart]); else [probeEnd] stops it.
+     */
+    private var probeUnclaimed = false
+
+    private val probeEnd = Runnable { endProbe() }
+
     var location: FlutterLocation? = null
         private set
 
@@ -358,6 +400,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
             // enableBackgroundMode() already put the service in the foreground;
             // this start only makes it a started, sticky service.
             ACTION_START -> Unit
+            ACTION_DRIVE -> startForDriveNow()
             // A null intent is the system's sticky restart after a process
             // kill; ACTION_RESTORE is the boot receiver. Both come without an
             // engine.
@@ -380,10 +423,8 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         Log.d(TAG, "Destroying service.")
         instance = null
         cancelDartCheck()
-        headlessEngine?.let {
-            headlessEngine = null
-            it.destroy()
-        }
+        mainHandler.removeCallbacks(probeEnd)
+        HeadlessLocationEngine.destroyNow()
 
         location?.dispose()
         location = null
@@ -424,6 +465,36 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
     }
 
     fun isInForegroundMode(): Boolean = isForeground
+
+    /** 1: the mode runs and Dart owns it. 2: a native start runs unclaimed. 0: off. */
+    fun backgroundModeAnswer(): Int =
+        when {
+            !isForeground -> 0
+            probeUnclaimed -> 2
+            else -> 1
+        }
+
+    /** Dart asked for the mode: from now on the service is Dart's to stop. */
+    fun claimForDart() {
+        probeUnclaimed = false
+        mainHandler.removeCallbacks(probeEnd)
+    }
+
+    private fun openProbeWindow() {
+        probeUnclaimed = true
+        mainHandler.removeCallbacks(probeEnd)
+        mainHandler.postDelayed(probeEnd, PROBE_WINDOW_MS)
+    }
+
+    /** Nobody claimed the native start: no drive, no restored drive. */
+    private fun endProbe() {
+        if (!probeUnclaimed) return
+        probeUnclaimed = false
+        if (isForeground) {
+            Log.d(TAG, "Nothing claimed the native start of the foreground service: stopping it.")
+            disableBackgroundMode()
+        }
+    }
 
     /**
      * Starts the service in foreground mode. Returns whether it succeeded:
@@ -472,6 +543,8 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
 
     fun disableBackgroundMode() {
         Log.d(TAG, "Stop service in foreground.")
+        probeUnclaimed = false
+        mainHandler.removeCallbacks(probeEnd)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -512,6 +585,29 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
             stopSelf()
             return
         }
+        // A restored drive claims it; a phone at rest lets it go.
+        openProbeWindow()
+        scheduleDartCheck(0)
+    }
+
+    /**
+     * A drive signal: the foreground now, then a Dart consumer. No persisted
+     * wish is needed first: [enableBackgroundMode] persists it. A refusal
+     * stops the service at once, so the system never times the start out.
+     */
+    private fun startForDriveNow() {
+        if (isForeground) {
+            // Dart's own service stays Dart's; an unclaimed one gets more time.
+            if (probeUnclaimed) openProbeWindow()
+            scheduleDartCheck(0)
+            return
+        }
+        if (!hasBackgroundLocationPermission(applicationContext) || !enableBackgroundMode()) {
+            Log.w(TAG, "The drive start of the foreground service failed: stopping.")
+            stopSelf()
+            return
+        }
+        openProbeWindow()
         scheduleDartCheck(0)
     }
 
@@ -562,7 +658,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
      * keep a notification for nothing.
      */
     private fun ensureDartConsumer() {
-        if (!isForeground || consumer != null || headlessEngine != null || hasForegroundEngine) return
+        if (!isForeground || consumer != null || HeadlessLocationEngine.isRunning || hasForegroundEngine) return
         val handle = prefs.getLong(PREFS_KEY_CALLBACK, 0L)
         if (handle == 0L) {
             Log.w(TAG, "No headless entry registered: stopping the foreground service.")
@@ -570,12 +666,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
             return
         }
         Log.d(TAG, "No Dart consumer: starting the headless engine.")
-        val engine = HeadlessLocationEngine.start(applicationContext, handle)
-        if (engine == null) {
-            disableBackgroundMode()
-            return
-        }
-        headlessEngine = engine
+        if (!HeadlessLocationEngine.startIfNone(applicationContext, handle)) disableBackgroundMode()
     }
 
     /**
@@ -584,9 +675,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
      * that engine goes.
      */
     private fun destroyHeadlessEngineLater() {
-        val engine = headlessEngine ?: return
-        headlessEngine = null
-        mainHandler.post { engine.destroy() }
+        HeadlessLocationEngine.destroyLater(mainHandler)
     }
 
     fun changeNotificationOptions(options: NotificationOptions): Map<String, Any>? {

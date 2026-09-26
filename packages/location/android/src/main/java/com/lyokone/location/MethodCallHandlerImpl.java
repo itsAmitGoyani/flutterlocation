@@ -8,6 +8,7 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -26,6 +27,7 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
     private static final String TAG = "MethodCallHandlerImpl";
 
     private final Context context;
+    private final LocationPlugin owner;
     private final Runnable onUse;
 
     /**
@@ -54,8 +56,9 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         }
     }
 
-    MethodCallHandlerImpl(Context context, Runnable onUse) {
+    MethodCallHandlerImpl(Context context, LocationPlugin owner, Runnable onUse) {
         this.context = context;
+        this.owner = owner;
         this.onUse = onUse;
     }
 
@@ -91,14 +94,28 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
 
     @Override
     public void onMethodCall(MethodCall call, Result result) {
-        // Answered without the service: iOS-only switches and platform facts.
+        // Answered without the service: the wake sources, the wake delivery
+        // and platform facts.
         switch (call.method) {
             case "wasLaunchedByLocationEvent":
-            case "setRelaunchMonitoring":
                 result.success(0);
                 return;
             case "isBackgroundPermissionGranted":
                 result.success(FlutterLocationService.hasBackgroundLocationPermission(context) ? 1 : 0);
+                return;
+            case "setRelaunchMonitoring":
+                onSetRelaunchMonitoring(call, result);
+                return;
+            case "listenForWakes":
+                WakeHub.listen(owner);
+                result.success(1);
+                return;
+            case "stopListeningForWakes":
+                WakeHub.unlisten(owner);
+                result.success(1);
+                return;
+            case "requestWake":
+                onRequestWake(call, result);
                 return;
             default:
                 break;
@@ -147,6 +164,48 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
                 result.notImplemented();
                 break;
         }
+    }
+
+    /**
+     * Arms or disarms the wake sources ({@link WakeMonitor}): the leash
+     * geofence, the activity transitions and the heartbeat alarm.
+     */
+    private void onSetRelaunchMonitoring(MethodCall call, Result result) {
+        final Boolean enable = call.argument("enable");
+        final Number heartbeatMs = call.argument("heartbeatMs");
+        final Number driveSpeedMps = call.argument("driveSpeedMps");
+        final Number latitude = call.argument("latitude");
+        final Number longitude = call.argument("longitude");
+        final boolean armed = WakeMonitor.setArmed(
+                context,
+                Boolean.TRUE.equals(enable),
+                heartbeatMs == null ? null : heartbeatMs.longValue(),
+                driveSpeedMps == null ? null : driveSpeedMps.floatValue(),
+                latitude == null ? null : latitude.doubleValue(),
+                longitude == null ? null : longitude.doubleValue());
+        result.success(armed ? 1 : 0);
+    }
+
+    /**
+     * A wake asked from Dart: the push isolate for a viewer. It never uploads
+     * itself; the engine that shares takes the wake.
+     */
+    private void onRequestWake(MethodCall call, Result result) {
+        final Map<String, Object> wake = new HashMap<>();
+        final Object kind = call.argument("kind");
+        wake.put("kind", kind != null ? kind.toString() : "refresh");
+        wake.put("ts", (double) System.currentTimeMillis());
+        WakeHub.enqueue(context, wake);
+        result.success(1);
+    }
+
+    /** Native to Dart: one wake for this engine's Dart side. Main thread. */
+    void invokeOnWake(Map<String, Object> wake, Result result) {
+        if (channel == null) {
+            result.error("NO_CHANNEL", "The method channel is gone.", null);
+            return;
+        }
+        channel.invokeMethod("onWake", wake, result);
     }
 
     /**
@@ -234,9 +293,14 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         location.requestPermissions();
     }
 
+    /**
+     * 2 for a service a native start runs and Dart has not claimed: Dart reads
+     * it as off, so a release before the wake arrives leaves it alone, and an
+     * acquire claims it through {@code enableBackgroundMode}.
+     */
     private void isBackgroundModeEnabled(Result result) {
         if (locationService != null) {
-            result.success(this.locationService.isInForegroundMode() ? 1 : 0);
+            result.success(this.locationService.backgroundModeAnswer());
         } else {
             result.success(0);
         }
@@ -247,6 +311,7 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         if (locationService != null && enable != null) {
             if (locationService.checkBackgroundPermissions()) {
                 if (enable) {
+                    locationService.claimForDart();
                     // 0 when the system refused the foreground start (Android 12+
                     // without an exemption): a plain answer, never a thrown error.
                     result.success(locationService.enableBackgroundMode() ? 1 : 0);

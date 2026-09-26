@@ -310,6 +310,10 @@ public class FlutterLocation
             public void onLocationResult(LocationResult locationResult) {
                 super.onLocationResult(locationResult);
                 Location location = locationResult.getLastLocation();
+                if (location != null) {
+                    // The leash follows the phone while fixes flow (AutoLNK fork).
+                    WakeMonitor.onFix(applicationContext, location);
+                }
                 HashMap<String, Object> loc = new HashMap<>();
                 loc.put("latitude", location.getLatitude());
                 loc.put("longitude", location.getLongitude());

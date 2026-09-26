@@ -1,6 +1,7 @@
 package com.lyokone.location
 
 import android.content.Context
+import android.os.Handler
 import android.util.Log
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
@@ -11,20 +12,60 @@ import io.flutter.view.FlutterCallbackInformation
  * Runs the app's registered Dart callback on an engine of its own, with no
  * Activity and no view: the Dart side of location sharing keeps running
  * after the app's engine is gone.
+ *
+ * One engine per process, whoever asks for it: the service during a drive
+ * ([FlutterLocationService]), or the wake hub for a short run at rest
+ * ([WakeHub]). Main thread only.
  */
 internal object HeadlessLocationEngine {
     private const val TAG = "HeadlessLocationEngine"
 
+    private var current: FlutterEngine? = null
+
+    val isRunning: Boolean
+        get() = current != null
+
+    /** Starts the engine unless one runs. Returns whether one runs afterwards. */
+    fun startIfNone(
+        context: Context,
+        callbackHandle: Long,
+    ): Boolean {
+        if (current != null) return true
+        current = start(context, callbackHandle)
+        return current != null
+    }
+
+    /** Destroys the engine now: an Activity-hosted engine takes over. */
+    fun destroyNow() {
+        val engine = current ?: return
+        current = null
+        engine.destroy()
+        WakeHub.onHeadlessGone()
+    }
+
     /**
-     * Main thread. Returns null when the callback cannot be resolved (a handle
-     * from a previous build after an app update) or the engine fails to
-     * start; the caller then gives up the foreground service.
+     * Destroys the engine on the next main-loop turn: the call that asks for
+     * it can run ON this engine, and its result must reach Dart first.
+     */
+    fun destroyLater(handler: Handler) {
+        val engine = current ?: return
+        current = null
+        handler.post {
+            engine.destroy()
+            WakeHub.onHeadlessGone()
+        }
+    }
+
+    /**
+     * Returns null when the callback cannot be resolved (a handle from a
+     * previous build after an app update) or the engine fails to start; the
+     * caller then gives up.
      *
      * `FlutterEngine(context)` registers every plugin of the app through the
      * generated registrant, so the location plugin itself is reachable from
      * the headless isolate.
      */
-    fun start(
+    private fun start(
         context: Context,
         callbackHandle: Long,
     ): FlutterEngine? {

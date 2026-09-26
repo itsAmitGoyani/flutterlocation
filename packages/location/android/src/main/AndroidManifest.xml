@@ -12,8 +12,15 @@
             android:exported="false"
             android:foregroundServiceType="location"
             android:name=".FlutterLocationService"/>
+        <!-- The wake sources at rest: the leash geofence, the activity
+             transitions and the heartbeat alarm (WakeMonitor). -->
+        <receiver
+            android:enabled="true"
+            android:exported="false"
+            android:name=".WakeReceiver"/>
         <!-- Restores the foreground service after a reboot or an app update
-             when background mode was wanted (FlutterLocationService.restoreIfWanted). -->
+             when background mode was wanted (FlutterLocationService.restoreIfWanted),
+             and arms the wake sources again (WakeMonitor.rearmIfArmed). -->
         <receiver
             android:enabled="true"
             android:exported="true"

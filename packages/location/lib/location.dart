@@ -45,6 +45,11 @@ class Location implements LocationPlatform {
   }
 
   /// Checks if service is enabled in the background mode.
+  ///
+  /// AutoLNK fork, Android: a service the system started (a drive signal, a
+  /// sticky restart, a reboot) answers false until Dart claims it with
+  /// [enableBackgroundMode], so a release that runs before the wake arrives
+  /// leaves it alone. Unclaimed, it stops itself after three minutes.
   @override
   Future<bool> isBackgroundModeEnabled() {
     return LocationPlatform.instance.isBackgroundModeEnabled();
@@ -173,17 +178,82 @@ class Location implements LocationPlatform {
     );
   }
 
-  /// iOS only. Arms or disarms the three services that relaunch a terminated
-  /// app under Always: significant-change monitoring, visits monitoring and
-  /// a region "leash" around the phone. The plugin re-arms them by itself on
-  /// every launch that had them armed, and on a launch for a location event
-  /// it also starts the ordinary updates before any Dart code runs. Returns
-  /// false without Always and on other platforms.
-  Future<bool> setRelaunchMonitoring({required bool enable}) {
+  /// Arms or disarms the system events that wake a sleeping or terminated
+  /// app under Always.
+  ///
+  /// iOS: significant-change monitoring, visits monitoring and a region
+  /// "leash" around the phone. The plugin re-arms them by itself on every
+  /// launch that had them armed, and on a launch for a location event it
+  /// also starts the ordinary updates before any Dart code runs.
+  ///
+  /// Android: a leash geofence, the activity transitions (with the Motion
+  /// permission) and a heartbeat alarm every [heartbeatMs] that Doze allows.
+  /// A vehicle transition, or a leash exit faster than [driveSpeedMps],
+  /// starts the foreground service for a drive; every other event reaches
+  /// the handler of [setWakeHandler] without a service. The boot receiver
+  /// re-arms them after a reboot or an app update.
+  ///
+  /// [latitude] and [longitude] put the leash on the spot where the app goes
+  /// to sleep. Returns false without the background location grant.
+  Future<bool> setRelaunchMonitoring({
+    required bool enable,
+    int? heartbeatMs,
+    double? driveSpeedMps,
+    double? latitude,
+    double? longitude,
+  }) {
     return _invokeFlag(
       'setRelaunchMonitoring',
-      <String, Object?>{'enable': enable},
+      <String, Object?>{
+        'enable': enable,
+        if (heartbeatMs != null) 'heartbeatMs': heartbeatMs,
+        if (driveSpeedMps != null) 'driveSpeedMps': driveSpeedMps,
+        if (latitude != null && longitude != null) 'latitude': latitude,
+        if (latitude != null && longitude != null) 'longitude': longitude,
+      },
     );
+  }
+
+  static Future<void> Function(Map<String, Object?> wake)? _wakeHandler;
+
+  /// Android only. Makes this engine's Dart side the one that takes the
+  /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat` or
+  /// `refresh`, and a leash wake carries the point of its exit
+  /// (`latitude`, `longitude`, `accuracy`, `speed`, `heading`, `time`). The
+  /// wake counts as done when [handler] completes. Null stops listening.
+  Future<bool> setWakeHandler(
+    Future<void> Function(Map<String, Object?> wake)? handler,
+  ) {
+    _wakeHandler = handler;
+    if (handler == null) {
+      _forkChannel.setMethodCallHandler(null);
+      return _invokeFlag('stopListeningForWakes');
+    }
+    _forkChannel.setMethodCallHandler(_onPlatformCall);
+    return _invokeFlag('listenForWakes');
+  }
+
+  static Future<Object?> _onPlatformCall(MethodCall call) async {
+    if (call.method != 'onWake') {
+      throw MissingPluginException('No handler for ${call.method}');
+    }
+    final Future<void> Function(Map<String, Object?> wake)? handler =
+        _wakeHandler;
+    if (handler == null) {
+      return 0;
+    }
+    final Object? raw = call.arguments;
+    final Map<String, Object?> wake = raw is Map
+        ? raw.map((Object? k, Object? v) => MapEntry<String, Object?>('$k', v))
+        : <String, Object?>{};
+    await handler(wake);
+    return 1;
+  }
+
+  /// Android only. Asks for a wake of [kind] on the engine that shares; the
+  /// push isolate uses it for a viewer, so it never uploads itself.
+  Future<bool> requestWake({String kind = 'refresh'}) {
+    return _invokeFlag('requestWake', <String, Object?>{'kind': kind});
   }
 
   /// iOS only. True when the system launched this process for a location
