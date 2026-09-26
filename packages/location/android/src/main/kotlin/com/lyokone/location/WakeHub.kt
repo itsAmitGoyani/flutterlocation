@@ -1,10 +1,12 @@
 package com.lyokone.location
 
 import android.content.Context
+import android.location.Location
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -40,6 +42,19 @@ internal object WakeHub {
     /** A wake older than this is dropped: its news is stale, and a newer wake follows. */
     private const val MAX_AGE_MS = 15 * 60 * 1000L
 
+    /**
+     * A drive wake older than this is dropped: it starts three minutes of
+     * driving GPS, and a drive that is still on sends a new signal.
+     */
+    private const val MAX_DRIVE_AGE_MS = 2 * 60 * 1000L
+
+    /**
+     * How long a Dart side has to answer one wake. Its own budget is 45 s;
+     * past this the wake counts as done, so one lost answer cannot block
+     * every later wake.
+     */
+    private const val ANSWER_LIMIT_MS = 50_000L
+
     private val lock = Any()
     private val main = Handler(Looper.getMainLooper())
 
@@ -56,6 +71,8 @@ internal object WakeHub {
     private val waiters = mutableListOf<() -> Unit>()
 
     private var appContext: Context? = null
+
+    private var answerLimit: Runnable? = null
 
     @JvmStatic
     fun attach(
@@ -91,11 +108,17 @@ internal object WakeHub {
         releaseWaitersIfNobodyCanTake()
     }
 
-    /** Any thread: persists the wake and schedules the job that delivers it. */
+    /**
+     * Any thread: persists the wake and schedules the job that delivers it.
+     * [onQueued] runs once WorkManager stored the job, so a receiver that
+     * went async can finish only then.
+     */
     @JvmStatic
+    @JvmOverloads
     fun enqueue(
         context: Context,
         wake: Map<String, Any?>,
+        onQueued: (() -> Unit)? = null,
     ) {
         val app = context.applicationContext
         synchronized(lock) {
@@ -106,11 +129,25 @@ internal object WakeHub {
         }
         try {
             val (name, request) = jobFor(wake["kind"])
-            WorkManager.getInstance(app).enqueueUniqueWork(name, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+            val operation = WorkManager.getInstance(app).enqueueUniqueWork(name, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+            if (onQueued != null) operation.result.addListener({ onQueued() }, ContextCompat.getMainExecutor(app))
         } catch (e: Exception) {
             Log.e(TAG, "The wake job could not be scheduled.", e)
+            onQueued?.invoke()
         }
     }
+
+    /** A fix as a wake's point: the fields Dart reads (`LocationWakeHandler.pointOf`). */
+    @JvmStatic
+    fun pointOf(location: Location): Map<String, Any?> =
+        buildMap {
+            put("latitude", location.latitude)
+            put("longitude", location.longitude)
+            if (location.hasAccuracy()) put("accuracy", location.accuracy.toDouble())
+            if (location.hasSpeed()) put("speed", location.speed.toDouble())
+            if (location.hasBearing()) put("heading", location.bearing.toDouble())
+            put("time", location.time.toDouble())
+        }
 
     /**
      * The job for one wake. On Android 12+ a wake that uploads runs as an
@@ -178,6 +215,16 @@ internal object WakeHub {
         }
         val id = next.optString("id")
         inFlight = id
+        val limit =
+            Runnable {
+                if (inFlight == id) {
+                    Log.w(TAG, "The Dart side did not answer a wake in ${ANSWER_LIMIT_MS / 1000} s: counting it as done.")
+                    delivered(context, id)
+                }
+            }
+        answerLimit?.let { main.removeCallbacks(it) }
+        answerLimit = limit
+        main.postDelayed(limit, ANSWER_LIMIT_MS)
         target.deliverWake(
             toMap(next),
             object : MethodChannel.Result {
@@ -211,7 +258,11 @@ internal object WakeHub {
             }
             writeQueue(context, kept)
         }
-        if (inFlight == id) inFlight = null
+        if (inFlight == id) {
+            inFlight = null
+            answerLimit?.let { main.removeCallbacks(it) }
+            answerLimit = null
+        }
         drain(context)
     }
 
@@ -232,11 +283,12 @@ internal object WakeHub {
     /** Under [lock]. The queue without the wakes older than [MAX_AGE_MS]. */
     private fun pruneStale(context: Context): JSONArray {
         val queue = readQueue(context)
-        val oldest = System.currentTimeMillis() - MAX_AGE_MS
+        val now = System.currentTimeMillis()
         val kept = JSONArray()
         for (i in 0 until queue.length()) {
             val item = queue.optJSONObject(i) ?: continue
-            if (item.optLong("queuedAt", 0L) >= oldest) kept.put(item)
+            val maxAge = if (item.optString("kind") == "drive") MAX_DRIVE_AGE_MS else MAX_AGE_MS
+            if (item.optLong("queuedAt", 0L) >= now - maxAge) kept.put(item)
         }
         if (kept.length() != queue.length()) writeQueue(context, kept)
         return kept

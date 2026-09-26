@@ -20,8 +20,15 @@
 @property(assign, nonatomic) BOOL applicationHasLocationBackgroundMode;
 
 // AutoLNK fork: the relaunch after a termination (see armRelaunchMonitoring).
-// iOS launched this process for a location event (UIApplicationLaunchOptionsLocationKey).
+// The plugin's own channel, for the calls it makes to Dart.
+@property(strong, nonatomic) FlutterMethodChannel *channel;
+// iOS launched or woke this process for a location event.
 @property(assign, nonatomic) BOOL launchedForLocation;
+// The relaunch monitors were armed when this process launched.
+@property(assign, nonatomic) BOOL armedAtLaunch;
+// Armed at launch while the grant read "not determined": the authorization
+// callback arms them once it reads Always.
+@property(assign, nonatomic) BOOL armOnAlways;
 // The three relaunch monitors are on; mirrors the persisted flag.
 @property(assign, nonatomic) BOOL relaunchArmed;
 // The region around the phone whose exit relaunches the app.
@@ -32,6 +39,20 @@
 // When the leash last moved: a delivered fix moves it at most every
 // kLeashRecenterMinIntervalSeconds, since a drive delivers one each second.
 @property(assign, nonatomic) NSTimeInterval lastLeashMoveAt;
+// A location event came before the first unlock after a reboot: the
+// keep-alive starts once the phone is unlocked.
+@property(assign, nonatomic) BOOL keepAliveOnUnlock;
+// NSUserDefaults could not be written (before the first unlock); written
+// when protected data becomes available.
+@property(assign, nonatomic) BOOL defaultsDirty;
+// This process launched before the first unlock, when NSUserDefaults read
+// as empty: the unlock reads the armed flag again.
+@property(assign, nonatomic) BOOL launchedLocked;
+// A one-shot getLocation runs at the best accuracy; the profile's accuracy
+// comes back with its fix.
+@property(assign, nonatomic) BOOL oneShotAccuracyRaised;
+@property(assign, nonatomic) CLLocationAccuracy savedAccuracy;
+@property(assign, nonatomic) NSUInteger oneShotGeneration;
 @end
 
 static NSString *const kRelaunchArmedKey = @"lyokone_location_relaunch_armed";
@@ -45,9 +66,11 @@ static const CLLocationDistance kLeashRecenterMeters = 75.0;
 static const CLLocationAccuracy kLeashMaxAccuracyMeters = 200.0;
 static const NSTimeInterval kLeashRecenterMinIntervalSeconds = 30.0;
 // How long a relaunched process keeps its own updates before it decides the
-// Dart side never came. The Dart launch waits up to 20 s for Firebase and
-// Remote Config on such a launch, and then starts the share.
+// Dart side never came. The Dart launch waits up to 20 s for Remote Config
+// on such a launch, and then starts the share.
 static const NSTimeInterval kDartWatchdogSeconds = 90.0;
+// The longest a one-shot read keeps the best accuracy without a fix.
+static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
 
 @implementation LocationPlugin
 
@@ -60,12 +83,18 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
                                 binaryMessenger:registrar.messenger];
 
   LocationPlugin *instance = [[LocationPlugin alloc] init];
+  instance.channel = channel;
   [registrar addMethodCallDelegate:instance channel:channel];
   [stream setStreamHandler:instance];
 #if TARGET_OS_IOS
   // For the launch options: a relaunch for a location event must restart
   // the monitors and the updates before any Dart code runs.
   [registrar addApplicationDelegate:instance];
+  [[NSNotificationCenter defaultCenter]
+      addObserver:instance
+         selector:@selector(protectedDataDidBecomeAvailable:)
+             name:UIApplicationProtectedDataDidBecomeAvailable
+           object:nil];
 #endif
 }
 
@@ -111,8 +140,15 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
       // lookup always failed, and every profile ran at accuracy 0, the best
       // one: GPS at full power, a still phone included. The same failed
       // lookup turned auto-pause off whatever Dart asked for.
-      self.clLocationManager.desiredAccuracy =
+      CLLocationAccuracy accuracy =
           [self accuracyForIndex:call.arguments[@"accuracy"]];
+      if (self.oneShotAccuracyRaised) {
+        // A one-shot read runs at the best accuracy; this one comes back
+        // with its fix.
+        self.savedAccuracy = accuracy;
+      } else {
+        self.clLocationManager.desiredAccuracy = accuracy;
+      }
       id filter = call.arguments[@"distanceFilter"];
       double distanceFilter =
           [filter isKindOfClass:[NSNumber class]] ? [filter doubleValue] : 0;
@@ -128,7 +164,8 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
       // Never leave the Dart call without an answer.
       result(@0);
     }
-  } else if ([call.method isEqualToString:@"isBackgroundModeEnabled"]) {
+  } else if ([call.method isEqualToString:@"isBackgroundModeEnabled"] ||
+             [call.method isEqualToString:@"backgroundModeState"]) {
     // AutoLNK: one answer. Upstream answered twice on iOS 9 and later, and
     // not at all without the location background mode.
     if (self.applicationHasLocationBackgroundMode) {
@@ -175,6 +212,9 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 
     self.flutterResult = result;
     self.locationWanted = YES;
+    // AutoLNK: a one-shot read asks for a precise fix, whatever accuracy the
+    // stream's profile runs at.
+    [self raiseAccuracyForOneShot];
 
     if ([self isPermissionGranted]) {
       [self.clLocationManager startUpdatingLocation];
@@ -260,21 +300,35 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
         [self setLeashAt:CLLocationCoordinate2DMake([lat doubleValue],
                                                     [lng doubleValue])];
       }
-      result(@1);
+      // 2: armed, but region monitoring needs precise location, so the
+      // leash cannot fire; significant change and visits still run.
+      result([self isHighAccuracyPermitted] ? @1 : @2);
     }
 #else
     result(@0);
 #endif
   } else if ([call.method isEqualToString:@"listenForWakes"] ||
              [call.method isEqualToString:@"stopListeningForWakes"] ||
-             [call.method isEqualToString:@"requestWake"]) {
+             [call.method isEqualToString:@"requestWake"] ||
+             [call.method isEqualToString:@"finishHeadlessRun"]) {
     // Android only: iOS relaunches the whole app and streams from Dart.
     result(@0);
+  } else if ([call.method isEqualToString:@"getCurrentFix"]) {
+    // Android only: the wakes that need it run on Android.
+    result(nil);
   } else if ([call.method isEqualToString:@"wasLaunchedByLocationEvent"]) {
 #if TARGET_OS_IOS
-    result(self.launchedForLocation ? @1 : @0);
+    result(self.launchedForLocation || [self isBackgroundLaunchWhileArmed]
+               ? @1
+               : @0);
 #else
     result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"isProtectedDataAvailable"]) {
+#if TARGET_OS_IOS
+    result(UIApplication.sharedApplication.isProtectedDataAvailable ? @1 : @0);
+#else
+    result(@1);
 #endif
   } else if ([call.method isEqualToString:@"isBackgroundPermissionGranted"]) {
 #if TARGET_OS_IOS
@@ -312,6 +366,36 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
     default:
       return kCLLocationAccuracyBest;
   }
+}
+
+// A one-shot read raises the accuracy for its own fix only; a read that
+// gets no fix gives it back after kOneShotAccuracySeconds.
+- (void)raiseAccuracyForOneShot {
+  self.oneShotGeneration += 1;
+  NSUInteger generation = self.oneShotGeneration;
+  if (!self.oneShotAccuracyRaised) {
+    self.savedAccuracy = self.clLocationManager.desiredAccuracy;
+    self.oneShotAccuracyRaised = YES;
+    self.clLocationManager.desiredAccuracy = kCLLocationAccuracyBest;
+  }
+  __weak LocationPlugin *weakSelf = self;
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)(kOneShotAccuracySeconds * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        LocationPlugin *strongSelf = weakSelf;
+        if (strongSelf != nil && strongSelf.oneShotGeneration == generation) {
+          [strongSelf restoreAccuracyAfterOneShot];
+        }
+      });
+}
+
+- (void)restoreAccuracyAfterOneShot {
+  if (!self.oneShotAccuracyRaised) {
+    return;
+  }
+  self.oneShotAccuracyRaised = NO;
+  self.clLocationManager.desiredAccuracy = self.savedAccuracy;
 }
 
 - (void)requestPermission {
@@ -422,6 +506,14 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 
 - (void)locationManager:(CLLocationManager *)manager
      didUpdateLocations:(NSArray<CLLocation *> *)locations {
+#if TARGET_OS_IOS
+  if (!self.flutterListening && !self.keepAliveUpdates &&
+      !self.locationWanted) {
+    // No updates of ours run, so this is a significant-change delivery: a
+    // relaunch or a wake for it.
+    [self noteMonitorEvent];
+  }
+#endif
   if (self.waitNextLocation > 0) {
     self.waitNextLocation -= 1;
     return;
@@ -450,6 +542,7 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
   if (self.locationWanted) {
     self.locationWanted = NO;
     self.flutterResult(coordinatesDict);
+    [self restoreAccuracyAfterOneShot];
   }
   if (self.flutterListening) {
     self.flutterEventSink(coordinatesDict);
@@ -464,8 +557,17 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 - (void)locationManager:(CLLocationManager *)manager
     didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
 #if TARGET_OS_IOS
-  if (self.relaunchArmed && status != kCLAuthorizationStatusAuthorizedAlways) {
+  if (status == kCLAuthorizationStatusAuthorizedAlways) {
+    // An armed launch that read "not determined" arms once Always is known.
+    if (self.armOnAlways) {
+      [self armRelaunchMonitoring];
+    }
+  } else if (status != kCLAuthorizationStatusNotDetermined &&
+             (self.relaunchArmed || self.armOnAlways) &&
+             [CLLocationManager locationServicesEnabled]) {
     // The grant no longer allows a background relaunch: keep no monitor.
+    // With Location Services off every app reads Denied, and the monitors
+    // stay for when they come back.
     [self disarmRelaunchMonitoring];
   }
 #endif
@@ -515,9 +617,46 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 #pragma mark - AutoLNK fork: the relaunch after a termination
 
 #if TARGET_OS_IOS
+- (CLAuthorizationStatus)authorizationStatus {
+  // The class method reads "not determined" until the process has a
+  // manager; the instance property (iOS 14) comes from that manager.
+  if (@available(iOS 14.0, *)) {
+    return self.clLocationManager.authorizationStatus;
+  }
+  return [CLLocationManager authorizationStatus];
+}
+
 - (BOOL)isAlwaysAuthorized {
-  return [CLLocationManager authorizationStatus] ==
-         kCLAuthorizationStatusAuthorizedAlways;
+  return [self authorizationStatus] == kCLAuthorizationStatusAuthorizedAlways;
+}
+
+// A launch into the background with the monitors armed and no scene: a
+// UIScene app gets no launch options, and the location event may reach the
+// delegate only after Dart asks. A user launch has a scene by then.
+- (BOOL)isBackgroundLaunchWhileArmed {
+  if (!self.armedAtLaunch) {
+    return NO;
+  }
+  UIApplication *application = UIApplication.sharedApplication;
+  if (application.applicationState != UIApplicationStateBackground) {
+    return NO;
+  }
+  if (@available(iOS 13.0, *)) {
+    return application.connectedScenes.count == 0;
+  }
+  return YES;
+}
+
+// The leash the system still monitors for this app, or nil. The system
+// keeps regions across relaunches and reboots.
+- (CLCircularRegion *)monitoredLeash {
+  for (CLRegion *region in self.clLocationManager.monitoredRegions) {
+    if ([region.identifier isEqualToString:kLeashIdentifier] &&
+        [region isKindOfClass:[CLCircularRegion class]]) {
+      return (CLCircularRegion *)region;
+    }
+  }
+  return nil;
 }
 
 // iOS relaunches a terminated app, under Always, for three services only:
@@ -525,25 +664,37 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 // table). After a user swipe only region monitoring is documented as
 // reliable, so a circular "leash" around the phone runs beside the other
 // two: leaving it relaunches the app, which then starts the ordinary
-// updates itself (see application:didFinishLaunchingWithOptions:).
+// updates itself (see noteMonitorEvent).
 - (void)armRelaunchMonitoring {
   [self initLocation];
+  self.armOnAlways = NO;
   CLLocationManager *manager = self.clLocationManager;
   if ([CLLocationManager significantLocationChangeMonitoringAvailable]) {
     [manager startMonitoringSignificantLocationChanges];
   }
   [manager startMonitoringVisits];
   self.relaunchArmed = YES;
-  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-  [defaults setBool:YES forKey:kRelaunchArmedKey];
-  // The leash comes back where it was; the next fix moves it when needed.
-  if ([defaults objectForKey:kLeashLatitudeKey] != nil &&
-      [defaults objectForKey:kLeashLongitudeKey] != nil) {
-    [self setLeashAt:CLLocationCoordinate2DMake(
-                         [defaults doubleForKey:kLeashLatitudeKey],
-                         [defaults doubleForKey:kLeashLongitudeKey])];
-  } else if (manager.location != nil) {
-    [self setLeashAt:manager.location.coordinate];
+  CLCircularRegion *monitored = [self monitoredLeash];
+  if (monitored != nil) {
+    // The system kept the leash: keep it, with its exit state. Registering
+    // it again at the same centre could drop an exit that is on its way.
+    self.leash = monitored;
+  } else {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (UIApplication.sharedApplication.isProtectedDataAvailable &&
+        [defaults objectForKey:kLeashLatitudeKey] != nil &&
+        [defaults objectForKey:kLeashLongitudeKey] != nil) {
+      [self setLeashAt:CLLocationCoordinate2DMake(
+                           [defaults doubleForKey:kLeashLatitudeKey],
+                           [defaults doubleForKey:kLeashLongitudeKey])];
+    } else if (manager.location != nil) {
+      [self setLeashAt:manager.location.coordinate];
+    }
+  }
+  [self persistRelaunchState];
+  if (self.leash != nil) {
+    // A phone already outside the kept leash gets no exit; the state says.
+    [manager requestStateForRegion:self.leash];
   }
 }
 
@@ -558,10 +709,42 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
   }
   self.leash = nil;
   self.relaunchArmed = NO;
+  self.armOnAlways = NO;
+  self.keepAliveOnUnlock = NO;
+  // A relaunch's own updates go with the monitors.
+  [self cancelDartWatchdog];
+  if (self.keepAliveUpdates) {
+    self.keepAliveUpdates = NO;
+    if (!self.flutterListening) {
+      [manager stopUpdatingLocation];
+      self.waitNextLocation = 2;
+    }
+  }
+  [self persistRelaunchState];
+}
+
+// The armed flag and the leash centre in NSUserDefaults, for the next
+// launch. Before the first unlock after a reboot the store cannot be
+// written; the write waits for protected data.
+- (void)persistRelaunchState {
+  if (!UIApplication.sharedApplication.isProtectedDataAvailable) {
+    self.defaultsDirty = YES;
+    return;
+  }
+  self.defaultsDirty = NO;
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-  [defaults removeObjectForKey:kRelaunchArmedKey];
-  [defaults removeObjectForKey:kLeashLatitudeKey];
-  [defaults removeObjectForKey:kLeashLongitudeKey];
+  if (self.relaunchArmed) {
+    [defaults setBool:YES forKey:kRelaunchArmedKey];
+    if (self.leash != nil) {
+      [defaults setDouble:self.leash.center.latitude forKey:kLeashLatitudeKey];
+      [defaults setDouble:self.leash.center.longitude
+                   forKey:kLeashLongitudeKey];
+    }
+  } else {
+    [defaults removeObjectForKey:kRelaunchArmedKey];
+    [defaults removeObjectForKey:kLeashLatitudeKey];
+    [defaults removeObjectForKey:kLeashLongitudeKey];
+  }
 }
 
 // One region under one identifier: a new centre replaces the old region.
@@ -585,9 +768,7 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
   [manager startMonitoringForRegion:region];
   self.leash = region;
   self.lastLeashMoveAt = [NSProcessInfo processInfo].systemUptime;
-  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-  [defaults setDouble:centre.latitude forKey:kLeashLatitudeKey];
-  [defaults setDouble:centre.longitude forKey:kLeashLongitudeKey];
+  [self persistRelaunchState];
 }
 
 // Per delivered fix: one distance, and a new region only past the
@@ -626,10 +807,58 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
   [self setLeashAt:location.coordinate];
 }
 
-// A launch for a location event under Always: the ordinary updates start
-// NOW, before any Dart runs, so iOS keeps the app alive as a location app
-// while the Dart side boots. Dart takes them over when it listens, or
-// turns everything off; the watchdog stops them if Dart never comes.
+// A location event (a leash exit, a visit, a significant change) while the
+// app runs in the background with nothing of Dart listening: iOS launched
+// or woke the app for it. Apple's advice for a UIScene app, whose launch
+// options are nil: the delegate callback is the signal. The ordinary
+// updates start NOW, so iOS keeps the app alive as a location app while
+// the Dart side boots; Dart takes them over when it listens, and the
+// watchdog stops them if it never comes.
+- (void)noteMonitorEvent {
+  if (!self.relaunchArmed || self.flutterListening || self.keepAliveUpdates) {
+    return;
+  }
+  if (![self isAlwaysAuthorized]) {
+    return;
+  }
+  UIApplication *application = UIApplication.sharedApplication;
+  if (application.applicationState != UIApplicationStateBackground) {
+    return;
+  }
+  self.launchedForLocation = YES;
+  if (!application.isProtectedDataAvailable) {
+    // Before the first unlock the app cannot read its session: start once
+    // the phone is unlocked.
+    self.keepAliveOnUnlock = YES;
+    return;
+  }
+  [self startKeepAliveUpdates];
+  [self.channel invokeMethod:@"onLocationLaunch" arguments:nil];
+}
+
+- (void)protectedDataDidBecomeAvailable:(NSNotification *)notification {
+  if (self.launchedLocked) {
+    // The launch could not read the armed flag; it can now.
+    self.launchedLocked = NO;
+    if (!self.relaunchArmed && [[NSUserDefaults standardUserDefaults]
+                                   boolForKey:kRelaunchArmedKey]) {
+      self.armedAtLaunch = YES;
+      [self initLocation];
+      if ([self isAlwaysAuthorized]) {
+        [self armRelaunchMonitoring];
+      }
+    }
+  }
+  if (self.defaultsDirty) {
+    [self persistRelaunchState];
+  }
+  if (!self.keepAliveOnUnlock) {
+    return;
+  }
+  self.keepAliveOnUnlock = NO;
+  [self noteMonitorEvent];
+}
+
 - (void)startKeepAliveUpdates {
   if (!self.applicationHasLocationBackgroundMode) {
     return;
@@ -669,29 +898,42 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 
 #pragma mark FlutterApplicationLifeCycleDelegate
 
-// The pending event reaches only a manager that monitors again after the
-// relaunch, so the monitors restart here, at once, on every launch that
-// had them armed. Only a launch FOR a location event also starts the
-// keep-alive updates; a user launch leaves the updates to Dart.
+// The pending event reaches only a manager that exists after the relaunch,
+// so the manager and the monitors come back here, at once, on every launch
+// that had them armed. A UIScene app gets nil launch options, so the launch
+// key serves only other hosts; noteMonitorEvent starts the keep-alive when
+// the event itself arrives.
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
   BOOL byLocation =
       launchOptions[UIApplicationLaunchOptionsLocationKey] != nil;
-  BOOL armed =
-      [[NSUserDefaults standardUserDefaults] boolForKey:kRelaunchArmedKey];
-  if (!byLocation && !armed) {
+  BOOL protectedData = application.isProtectedDataAvailable;
+  // Before the first unlock NSUserDefaults reads as empty; the leash the
+  // system kept tells whether the monitors were armed.
+  BOOL armed = protectedData && [[NSUserDefaults standardUserDefaults]
+                                    boolForKey:kRelaunchArmedKey];
+  if (!armed && !byLocation && protectedData) {
     return YES;
   }
   [self initLocation];
-  if (byLocation) {
-    self.launchedForLocation = YES;
+  if (!protectedData) {
+    self.launchedLocked = YES;
+    armed = [self monitoredLeash] != nil;
   }
-  if ([self isAlwaysAuthorized]) {
+  self.armedAtLaunch = armed;
+  if (!armed) {
+    return YES;
+  }
+  CLAuthorizationStatus status = [self authorizationStatus];
+  if (status == kCLAuthorizationStatusAuthorizedAlways) {
     [self armRelaunchMonitoring];
     if (byLocation) {
-      [self startKeepAliveUpdates];
+      [self noteMonitorEvent];
     }
-  } else {
+  } else if (status == kCLAuthorizationStatusNotDetermined) {
+    // An early read can say this; the authorization callback decides.
+    self.armOnAlways = YES;
+  } else if ([CLLocationManager locationServicesEnabled]) {
     [self disarmRelaunchMonitoring];
   }
   return YES;
@@ -704,15 +946,28 @@ static const NSTimeInterval kDartWatchdogSeconds = 90.0;
   if (![region.identifier isEqualToString:kLeashIdentifier]) {
     return;
   }
-  // The wake itself is the value: a relaunched app starts updates in
-  // didFinishLaunching, a running one already streams. Re-centre where
-  // the system says the phone is now, so the next exit is a real move.
+  // The wake itself is the value. Re-centre where the system says the
+  // phone is now, so the next exit is a real move.
+  [self noteMonitorEvent];
   [self moveLeashTo:manager.location];
 }
 
 - (void)locationManager:(CLLocationManager *)manager
+      didDetermineState:(CLRegionState)state
+              forRegion:(CLRegion *)region {
+  if (![region.identifier isEqualToString:kLeashIdentifier]) {
+    return;
+  }
+  // A kept leash the phone already left fires no exit: move it.
+  if (state == CLRegionStateOutside) {
+    [self moveLeashTo:manager.location];
+  }
+}
+
+- (void)locationManager:(CLLocationManager *)manager
                didVisit:(CLVisit *)visit {
-  // An arrival or a departure: the relaunch is the value; nothing to do.
+  // An arrival or a departure: the relaunch is the value.
+  [self noteMonitorEvent];
 }
 
 - (void)locationManager:(CLLocationManager *)manager

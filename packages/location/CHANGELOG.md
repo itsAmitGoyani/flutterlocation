@@ -33,6 +33,38 @@
 
 ### 🐛 Bug fixes
 
+- **iOS (review 2026-09-26):** a UIScene app gets nil launch options, so a
+  relaunch for a location event was never seen and nothing started. The
+  location event itself is now the signal: a leash exit, a visit or a
+  significant change in the background with no Dart listener starts the
+  keep-alive updates and calls `onLocationLaunch` (`setLocationLaunchHandler`).
+  `wasLaunchedByLocationEvent` also answers true for a launch into the
+  background with the monitors armed and no scene. Before the first unlock
+  after a reboot nothing is written to NSUserDefaults and the keep-alive
+  waits for the unlock (`isProtectedDataAvailable`). A disarm stops the
+  keep-alive; a leash the system kept is reused (`requestStateForRegion`
+  moves it when the phone is outside); only a clear "not Always" disarms at
+  launch, and Location Services off keeps the monitors. `setRelaunchMonitoring`
+  answers 2 under approximate location (no region monitoring). A one-shot
+  `getLocation` reads at the best accuracy.
+- **Android (review 2026-09-26):** a Dart disable no longer destroys the
+  headless engine that asked (its reconcile could not finish, and a
+  give-up never disarmed the wake sources); the Dart side ends a headless
+  run with `finishHeadlessRun`, and a headless engine whose Dart side makes
+  no call in 90 s is destroyed. A leash exit, a stop, a parked car, a
+  refresh push and a reboot take one fix in a short foreground run that
+  ends before Android shows its notification; at car speed the run becomes
+  the drive probe. `getCurrentFix` gives one bounded fix;
+  `backgroundModeState` gives the raw 0/1/2. The leash moves only to a fix
+  of 75 m or better, reports whether Play services holds it (`leashOk`),
+  and comes back on the heartbeat. The receivers go async until the job is
+  stored, disarm when the background grant is gone, and read every event of
+  a transition batch. A drive wake older than 2 min is dropped, and a wake
+  that Dart does not answer in 50 s counts as done. In the drive-only mode a
+  reboot takes one fix instead of restoring a stale drive service
+  (`restoreServiceAtBoot`), and a refused sticky restart still wakes Dart.
+  The app can add its own channels to a headless engine
+  (`HeadlessLocationEngine.configureEngine`).
 - **iOS:** `changeSettings` maps the accuracy by its index. The upstream
   lookup used string keys for a number, so every profile ran at accuracy 0
   (the best, GPS at full power) and auto-pause was always off whatever Dart

@@ -2,6 +2,7 @@ package com.lyokone.location
 
 import android.content.Context
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
@@ -15,55 +16,118 @@ import io.flutter.view.FlutterCallbackInformation
  *
  * One engine per process, whoever asks for it: the service during a drive
  * ([FlutterLocationService]), or the wake hub for a short run at rest
- * ([WakeHub]). Main thread only.
+ * ([WakeHub]). The engine lives until its Dart side ends the run
+ * ([finish]), the app opens ([destroyNow]), or its Dart side never makes a
+ * call ([DART_START_LIMIT_MS]). Main thread only.
  */
-internal object HeadlessLocationEngine {
+object HeadlessLocationEngine {
     private const val TAG = "HeadlessLocationEngine"
+
+    /**
+     * How long a new engine may take before its Dart side makes its first
+     * call to this plugin. The core init waits up to 20 s for Remote Config;
+     * an engine that stays silent past this never started its Dart side, and
+     * every wake would wait for it.
+     */
+    private const val DART_START_LIMIT_MS = 90_000L
+
+    /**
+     * The app adds to a headless engine what its own engine gets from the
+     * Activity: its own method and event channels. Set it in
+     * `Application.onCreate`, before a receiver or a service can start an
+     * engine.
+     */
+    @JvmStatic
+    var configureEngine: ((FlutterEngine) -> Unit)? = null
+
+    private val main = Handler(Looper.getMainLooper())
 
     private var current: FlutterEngine? = null
 
+    /** The engine's own instance of this plugin. */
+    private var plugin: LocationPlugin? = null
+
+    private var dartStarted = false
+
+    private val dartStartCheck =
+        Runnable {
+            if (current != null && !dartStarted) {
+                Log.w(TAG, "The headless Dart side made no call in ${DART_START_LIMIT_MS / 1000} s: destroying the engine.")
+                destroyNow()
+            }
+        }
+
+    @JvmStatic
     val isRunning: Boolean
         get() = current != null
 
+    /** Whether [candidate] is the plugin instance of the headless engine. */
+    @JvmStatic
+    fun owns(candidate: LocationPlugin): Boolean = current != null && plugin === candidate
+
+    /** A call from the headless engine's Dart side proves that it started. */
+    @JvmStatic
+    fun noteCall(caller: LocationPlugin) {
+        if (dartStarted || !owns(caller)) return
+        dartStarted = true
+        main.removeCallbacks(dartStartCheck)
+    }
+
     /** Starts the engine unless one runs. Returns whether one runs afterwards. */
+    @JvmStatic
     fun startIfNone(
         context: Context,
         callbackHandle: Long,
     ): Boolean {
         if (current != null) return true
-        current = start(context, callbackHandle)
-        return current != null
+        val engine = start(context, callbackHandle) ?: return false
+        current = engine
+        plugin = engine.plugins.get(LocationPlugin::class.java) as? LocationPlugin
+        dartStarted = false
+        main.removeCallbacks(dartStartCheck)
+        main.postDelayed(dartStartCheck, DART_START_LIMIT_MS)
+        return true
     }
 
     /** Destroys the engine now: an Activity-hosted engine takes over. */
+    @JvmStatic
     fun destroyNow() {
         val engine = current ?: return
-        current = null
+        clear()
         engine.destroy()
         WakeHub.onHeadlessGone()
     }
 
     /**
-     * Destroys the engine on the next main-loop turn: the call that asks for
-     * it can run ON this engine, and its result must reach Dart first.
+     * The headless Dart side ended its run: it gave up, or nothing is left
+     * to share. Destroyed on the next main-loop turn, because the call that
+     * asks for it runs ON this engine, and its result must reach Dart first.
      */
-    fun destroyLater(handler: Handler) {
+    @JvmStatic
+    fun finish() {
         val engine = current ?: return
-        current = null
-        handler.post {
+        clear()
+        main.post {
             engine.destroy()
             WakeHub.onHeadlessGone()
         }
     }
 
+    private fun clear() {
+        current = null
+        plugin = null
+        dartStarted = false
+        main.removeCallbacks(dartStartCheck)
+    }
+
     /**
-     * Returns null when the callback cannot be resolved (a handle from a
-     * previous build after an app update) or the engine fails to start; the
-     * caller then gives up.
+     * Returns null when the callback cannot be resolved (the entry function
+     * was renamed or moved) or the engine fails to start; the caller then
+     * gives up.
      *
      * `FlutterEngine(context)` registers every plugin of the app through the
      * generated registrant, so the location plugin itself is reachable from
-     * the headless isolate.
+     * the headless isolate; [configureEngine] adds the app's own channels.
      */
     private fun start(
         context: Context,
@@ -75,10 +139,15 @@ internal object HeadlessLocationEngine {
             loader.ensureInitializationComplete(context, null)
             val callback = FlutterCallbackInformation.lookupCallbackInformation(callbackHandle)
             if (callback == null) {
-                Log.w(TAG, "The headless callback handle $callbackHandle resolves to nothing (stale after an update?).")
+                Log.w(TAG, "The headless callback handle $callbackHandle resolves to nothing.")
                 return null
             }
             val engine = FlutterEngine(context)
+            try {
+                configureEngine?.invoke(engine)
+            } catch (e: Exception) {
+                Log.e(TAG, "The app could not configure the headless engine.", e)
+            }
             engine.dartExecutor.executeDartCallback(
                 DartExecutor.DartCallback(context.assets, loader.findAppBundlePath(), callback),
             )

@@ -51,13 +51,21 @@ internal object WakeMonitor {
     private const val KEY_DRIVE_SPEED = "wake_drive_speed_mps"
     private const val KEY_LEASH_LAT = "wake_leash_lat"
     private const val KEY_LEASH_LNG = "wake_leash_lng"
+    private const val KEY_LEASH_OK = "wake_leash_ok"
+    private const val KEY_LAST_RECENTRE = "wake_leash_recentred_at"
 
     private const val LEASH_ID = "lyokone.location.leash"
 
     /** Region monitoring is reliable from about 100 m. The iOS leash uses the same numbers. */
     private const val LEASH_RADIUS_M = 150f
     private const val LEASH_RECENTRE_M = 75f
-    private const val LEASH_MAX_ACCURACY_M = 200f
+
+    /**
+     * The coarsest fix the leash moves to. A centre as coarse as the radius
+     * puts a still phone outside its own leash, and every exit then wakes
+     * the app for nothing.
+     */
+    const val LEASH_MAX_ACCURACY_M = 75f
 
     /** A delivered fix moves the leash at most this often: during a drive the fixes come every second. */
     private const val LEASH_RECENTRE_MIN_INTERVAL_MS = 30_000L
@@ -83,14 +91,24 @@ internal object WakeMonitor {
         }
     }
 
-    private var lastRecentreAtMs = 0L
-
     private fun prefs(context: Context): SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     @JvmStatic
     fun isArmed(context: Context): Boolean = prefs(context).getBoolean(KEY_ARMED, false)
 
     fun driveSpeedMps(context: Context): Float = prefs(context).getFloat(KEY_DRIVE_SPEED, DEFAULT_DRIVE_SPEED_MPS)
+
+    /**
+     * Whether Play services holds the leash now. False after a failed add,
+     * and after GEOFENCE_NOT_AVAILABLE (Google Location Accuracy off), when
+     * the system drops every geofence. The heartbeat adds it again.
+     */
+    fun isLeashOk(context: Context): Boolean = prefs(context).getBoolean(KEY_LEASH_OK, false)
+
+    /** Play services dropped the leash (GEOFENCE_NOT_AVAILABLE). */
+    fun onLeashLost(context: Context) {
+        prefs(context).edit().putBoolean(KEY_LEASH_OK, false).apply()
+    }
 
     /**
      * Arms every source, or disarms them all. Idempotent: an armed call
@@ -106,8 +124,12 @@ internal object WakeMonitor {
         driveSpeedMps: Float?,
         latitude: Double?,
         longitude: Double?,
+        restoreServiceAtBoot: Boolean?,
+        fixTitle: String?,
+        fixBody: String?,
     ): Boolean {
         val app = context.applicationContext
+        FlutterLocationService.saveWakeOptions(app, restoreServiceAtBoot, fixTitle, fixBody)
         if (!enable || !FlutterLocationService.hasBackgroundLocationPermission(app)) {
             disarm(app)
             return false
@@ -145,7 +167,7 @@ internal object WakeMonitor {
         val app = context.applicationContext
         val p = prefs(app)
         if (!p.getBoolean(KEY_ARMED, false) && !p.contains(KEY_LEASH_LAT)) return
-        p.edit().putBoolean(KEY_ARMED, false).remove(KEY_LEASH_LAT).remove(KEY_LEASH_LNG).apply()
+        p.edit().putBoolean(KEY_ARMED, false).putBoolean(KEY_LEASH_OK, false).remove(KEY_LEASH_LAT).remove(KEY_LEASH_LNG).apply()
         try {
             LocationServices.getGeofencingClient(app).removeGeofences(listOf(LEASH_ID))
         } catch (e: Exception) {
@@ -164,7 +186,9 @@ internal object WakeMonitor {
         if (!isArmed(context)) return
         if (!location.hasAccuracy() || location.accuracy > LEASH_MAX_ACCURACY_M) return
         val now = SystemClock.elapsedRealtime()
-        if (now - lastRecentreAtMs < LEASH_RECENTRE_MIN_INTERVAL_MS) return
+        // Monotonic, so a reboot starts it over; a stored time ahead of now is from before one.
+        val last = prefs(context).getLong(KEY_LAST_RECENTRE, 0L).let { if (it > now) 0L else it }
+        if (now - last < LEASH_RECENTRE_MIN_INTERVAL_MS) return
         val centre = savedCentre(context)
         if (centre != null) {
             val distance = FloatArray(1)
@@ -177,7 +201,9 @@ internal object WakeMonitor {
     /**
      * One geofence under one id: a new centre replaces the old one. A phone
      * that is already outside the new circle gets its exit at once, so a
-     * stale centre can never leave the leash without an exit.
+     * stale centre can never leave the leash without an exit. The centre is
+     * kept whatever the result (a later add uses it); [KEY_LEASH_OK] says
+     * whether Play services holds it.
      */
     fun setLeash(
         context: Context,
@@ -185,8 +211,12 @@ internal object WakeMonitor {
         longitude: Double,
     ) {
         val app = context.applicationContext
-        lastRecentreAtMs = SystemClock.elapsedRealtime()
-        prefs(app).edit().putString(KEY_LEASH_LAT, latitude.toString()).putString(KEY_LEASH_LNG, longitude.toString()).apply()
+        prefs(app)
+            .edit()
+            .putLong(KEY_LAST_RECENTRE, SystemClock.elapsedRealtime())
+            .putString(KEY_LEASH_LAT, latitude.toString())
+            .putString(KEY_LEASH_LNG, longitude.toString())
+            .apply()
         val geofence =
             Geofence.Builder()
                 .setRequestId(LEASH_ID)
@@ -202,9 +232,14 @@ internal object WakeMonitor {
         try {
             LocationServices.getGeofencingClient(app)
                 .addGeofences(request, pendingIntent(app, ACTION_GEOFENCE, RC_GEOFENCE, mutable = true))
-                .addOnFailureListener { Log.w(TAG, "The leash geofence was not added.", it) }
+                .addOnSuccessListener { prefs(app).edit().putBoolean(KEY_LEASH_OK, true).apply() }
+                .addOnFailureListener {
+                    Log.w(TAG, "The leash geofence was not added.", it)
+                    prefs(app).edit().putBoolean(KEY_LEASH_OK, false).apply()
+                }
         } catch (e: SecurityException) {
             Log.w(TAG, "No location permission for the leash geofence.", e)
+            prefs(app).edit().putBoolean(KEY_LEASH_OK, false).apply()
         }
     }
 
@@ -221,7 +256,8 @@ internal object WakeMonitor {
         }
     }
 
-    private fun armLeash(context: Context) {
+    /** The leash at the saved centre, else at the last known position. */
+    fun armLeash(context: Context) {
         val centre = savedCentre(context)
         if (centre != null) {
             setLeash(context, centre.first, centre.second)

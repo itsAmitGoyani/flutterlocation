@@ -2,10 +2,16 @@ package com.lyokone.location;
 
 import android.content.Context;
 import android.graphics.Color;
+import android.location.Location;
 import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
+
+import com.google.android.gms.location.CurrentLocationRequest;
+import com.google.android.gms.location.LocationServices;
+import com.google.android.gms.location.Priority;
+import com.google.android.gms.tasks.CancellationTokenSource;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -94,11 +100,23 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
 
     @Override
     public void onMethodCall(MethodCall call, Result result) {
+        // Any call proves that a headless engine's Dart side started.
+        HeadlessLocationEngine.noteCall(owner);
         // Answered without the service: the wake sources, the wake delivery
         // and platform facts.
         switch (call.method) {
             case "wasLaunchedByLocationEvent":
                 result.success(0);
+                return;
+            case "isProtectedDataAvailable":
+                // An iOS fact (data protection before the first unlock).
+                result.success(1);
+                return;
+            case "finishHeadlessRun":
+                onFinishHeadlessRun(result);
+                return;
+            case "getCurrentFix":
+                onGetCurrentFix(call, result);
                 return;
             case "isBackgroundPermissionGranted":
                 result.success(FlutterLocationService.hasBackgroundLocationPermission(context) ? 1 : 0);
@@ -151,6 +169,9 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
             case "isBackgroundModeEnabled":
                 isBackgroundModeEnabled(result);
                 break;
+            case "backgroundModeState":
+                result.success(locationService != null ? locationService.backgroundModeAnswer() : 0);
+                break;
             case "enableBackgroundMode":
                 enableBackgroundMode(call, result);
                 break;
@@ -176,27 +197,78 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         final Number driveSpeedMps = call.argument("driveSpeedMps");
         final Number latitude = call.argument("latitude");
         final Number longitude = call.argument("longitude");
+        final Boolean restoreServiceAtBoot = call.argument("restoreServiceAtBoot");
+        final String fixTitle = call.argument("fixTitle");
+        final String fixBody = call.argument("fixBody");
         final boolean armed = WakeMonitor.setArmed(
                 context,
                 Boolean.TRUE.equals(enable),
                 heartbeatMs == null ? null : heartbeatMs.longValue(),
                 driveSpeedMps == null ? null : driveSpeedMps.floatValue(),
                 latitude == null ? null : latitude.doubleValue(),
-                longitude == null ? null : longitude.doubleValue());
+                longitude == null ? null : longitude.doubleValue(),
+                restoreServiceAtBoot,
+                fixTitle,
+                fixBody);
         result.success(armed ? 1 : 0);
     }
 
     /**
      * A wake asked from Dart: the push isolate for a viewer. It never uploads
-     * itself; the engine that shares takes the wake.
+     * itself; the engine that shares takes the wake. A high-priority push
+     * lets the app start a foreground service, so a refresh first tries a
+     * short fix run (a fresh fix); a lowered push falls back to the job.
      */
     private void onRequestWake(MethodCall call, Result result) {
         final Map<String, Object> wake = new HashMap<>();
         final Object kind = call.argument("kind");
         wake.put("kind", kind != null ? kind.toString() : "refresh");
         wake.put("ts", (double) System.currentTimeMillis());
-        WakeHub.enqueue(context, wake);
+        if (!("refresh".equals(wake.get("kind")) && WakeMonitor.isArmed(context) && FlutterLocationService.startForFix(context, wake))) {
+            WakeHub.enqueue(context, wake);
+        }
         result.success(1);
+    }
+
+    /**
+     * The headless Dart side ended its run (it gave up, or nothing is left
+     * to share). Only that engine's own call ends it.
+     */
+    private void onFinishHeadlessRun(Result result) {
+        if (!HeadlessLocationEngine.owns(owner)) {
+            result.success(0);
+            return;
+        }
+        // Destroyed on the next main-loop turn, after this answer.
+        HeadlessLocationEngine.finish();
+        result.success(1);
+    }
+
+    /**
+     * One fix, bounded: Play services ends the request at the time limit, so
+     * a background app that gets no fix leaves no request behind (a
+     * getLocation stream request stays on until its first fix). Null when
+     * no fix came.
+     */
+    private void onGetCurrentFix(MethodCall call, Result result) {
+        final Number timeoutMs = call.argument("timeoutMs");
+        final Boolean highAccuracy = call.argument("highAccuracy");
+        final long durationMs = timeoutMs == null ? 10_000L : Math.max(1_000L, timeoutMs.longValue());
+        try {
+            final CurrentLocationRequest request = new CurrentLocationRequest.Builder()
+                    .setPriority(Boolean.TRUE.equals(highAccuracy) ? Priority.PRIORITY_HIGH_ACCURACY : Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+                    .setDurationMillis(durationMs)
+                    .setMaxUpdateAgeMillis(60_000L)
+                    .build();
+            LocationServices.getFusedLocationProviderClient(context)
+                    .getCurrentLocation(request, new CancellationTokenSource().getToken())
+                    .addOnCompleteListener(task -> {
+                        final Location fix = task.isSuccessful() ? task.getResult() : null;
+                        result.success(fix == null ? null : WakeHub.pointOf(fix));
+                    });
+        } catch (SecurityException e) {
+            result.success(null);
+        }
     }
 
     /** Native to Dart: one wake for this engine's Dart side. Main thread. */

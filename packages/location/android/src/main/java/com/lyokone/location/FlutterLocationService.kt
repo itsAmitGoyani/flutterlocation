@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.Location
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
@@ -23,6 +24,10 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.CurrentLocationRequest
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import org.json.JSONException
@@ -178,6 +183,31 @@ class BackgroundNotification(
         updateChannel(options.channelName)
         return builder.build()
     }
+
+    /**
+     * The notification of a short fix run: its own copy, and deferred, so
+     * Android 12+ shows nothing for a run that ends within 10 s. The
+     * options the app set stay for a drive.
+     */
+    fun buildFix(
+        title: String?,
+        text: String?,
+    ): Notification {
+        updateChannel(options.channelName)
+        val iconId =
+            getDrawableId(options.iconName).let {
+                if (it != 0) it else getDrawableId(kDefaultNotificationIconName)
+            }
+        val fix =
+            NotificationCompat.Builder(context, channelId)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setSmallIcon(iconId)
+                .setContentTitle(title ?: options.title)
+                .setContentText(text)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
+        if (options.onTapBringToFront) fix.setContentIntent(buildBringToFrontIntent())
+        return fix.build()
+    }
 }
 
 /**
@@ -211,10 +241,28 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         /** A native drive signal ([WakeReceiver]): the foreground for the drive probe. */
         const val ACTION_DRIVE = "com.lyokone.location.action.DRIVE"
 
+        /** A short fix run for a wake ([startForFix]); the wake rides in [EXTRA_WAKE]. */
+        const val ACTION_FIX = "com.lyokone.location.action.FIX"
+        private const val EXTRA_WAKE = "wake"
+
         private const val PREFS_NAME = "flutter_location_prefs"
         private const val PREFS_KEY_WANTED = "background_mode_wanted"
         private const val PREFS_KEY_CALLBACK = "headless_callback_handle"
         private const val PREFS_KEY_NOTIFICATION = "notification_options"
+        private const val PREFS_KEY_RESTORE_AT_BOOT = "restore_at_boot"
+        private const val PREFS_KEY_FIX_TITLE = "fix_title"
+        private const val PREFS_KEY_FIX_BODY = "fix_body"
+
+        /**
+         * How long a fix run waits for its fix. The run then ends inside the
+         * 10 s for which Android 12+ holds back the notification of a
+         * foreground service, so a run at rest shows none.
+         */
+        private const val FIX_RUN_MS = 7_000L
+        private const val FIX_RUN_LIMIT_MS = 7_500L
+
+        /** A fix this recent serves the run; an older one is taken again. */
+        private const val FIX_MAX_AGE_MS = 5_000L
 
         /**
          * How long the service waits after its Dart consumer went before it
@@ -271,9 +319,75 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
             }
         }
 
-        /** Whether the service of this process runs in the foreground now. */
+        /**
+         * Starts a short fix run for a system wake (a leash exit, an
+         * activity change, a refresh push, a reboot): the foreground for one
+         * fix, the only way a sleeping app gets a fresh one (Android gives a
+         * background app a few fixes an hour). Only an exempt event may start
+         * it; a refusal answers false, and the caller queues the wake without
+         * a fix. The fix rides the wake to Dart; at car speed the run becomes
+         * the drive probe.
+         */
         @JvmStatic
-        fun isForegroundNow(): Boolean = instance?.isInForegroundMode() == true
+        fun startForFix(
+            context: Context,
+            wake: Map<String, Any?>,
+        ): Boolean {
+            if (!hasBackgroundLocationPermission(context)) return false
+            return try {
+                val intent =
+                    Intent(context, FlutterLocationService::class.java)
+                        .setAction(ACTION_FIX)
+                        .putExtra(EXTRA_WAKE, JSONObject(wake).toString())
+                ContextCompat.startForegroundService(context, intent)
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "The system refused the fix run of the foreground service.", e)
+                false
+            }
+        }
+
+        /**
+         * What the app says about its service (the wake options of
+         * `setRelaunchMonitoring`): whether a reboot brings the service back
+         * (the old always-on mode) or only runs one fix (the drive-only
+         * mode), and the copy of a fix run's notification.
+         */
+        @JvmStatic
+        fun saveWakeOptions(
+            context: Context,
+            restoreAtBoot: Boolean?,
+            fixTitle: String?,
+            fixBody: String?,
+        ) {
+            val editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            if (restoreAtBoot != null) editor.putBoolean(PREFS_KEY_RESTORE_AT_BOOT, restoreAtBoot)
+            if (fixTitle != null) editor.putString(PREFS_KEY_FIX_TITLE, fixTitle)
+            if (fixBody != null) editor.putString(PREFS_KEY_FIX_BODY, fixBody)
+            editor.apply()
+        }
+
+        /** Whether a reboot restores a wanted service; true when the app never said. */
+        @JvmStatic
+        fun restoresAtBoot(context: Context): Boolean = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(PREFS_KEY_RESTORE_AT_BOOT, true)
+
+        /**
+         * Forgets the wish for the service: in the drive-only mode a reboot
+         * ends any drive, and a wish that a crash or a force stop left behind
+         * would post the drive notification at a later boot.
+         */
+        @JvmStatic
+        fun dropWish(context: Context) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(PREFS_KEY_WANTED, false).apply()
+        }
+
+        /**
+         * Whether the service of this process runs in the foreground for the
+         * share (a drive, the always-on mode). A short fix run does not count:
+         * an event during one must still act.
+         */
+        @JvmStatic
+        fun isForegroundNow(): Boolean = instance?.let { it.isInForegroundMode() && !it.fixRunOnly } == true
 
         /** The registered headless entry, or 0. */
         @JvmStatic
@@ -358,6 +472,19 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
 
     private val probeEnd = Runnable { endProbe() }
 
+    /**
+     * The foreground runs for one fix only ([runFix]), not for the share. It
+     * answers 0 to Dart, never restarts sticky, and stops at the fix unless
+     * a drive or Dart claims it first ([adoptFixRun]).
+     */
+    private var fixRunOnly = false
+
+    /** The wakes that wait for the fix of the current run. */
+    private val fixRunWakes = mutableListOf<Map<String, Any?>>()
+    private var fixCancel: CancellationTokenSource? = null
+    private var fixDone = true
+    private val fixLimit = Runnable { finishFix(null) }
+
     var location: FlutterLocation? = null
         private set
 
@@ -401,12 +528,15 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
             // this start only makes it a started, sticky service.
             ACTION_START -> Unit
             ACTION_DRIVE -> startForDriveNow()
+            ACTION_FIX -> runFix(intent.getStringExtra(EXTRA_WAKE))
+            // The boot receiver: a foreground start the system waits for.
+            ACTION_RESTORE -> restoreForeground(fromBoot = true)
             // A null intent is the system's sticky restart after a process
-            // kill; ACTION_RESTORE is the boot receiver. Both come without an
-            // engine.
-            else -> restoreForeground()
+            // kill. Both come without an engine.
+            else -> restoreForeground(fromBoot = false)
         }
-        return if (isForeground) START_STICKY else START_NOT_STICKY
+        // A fix run must never come back after a kill; the share does.
+        return if (isForeground && !fixRunOnly) START_STICKY else START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder {
@@ -424,6 +554,9 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         instance = null
         cancelDartCheck()
         mainHandler.removeCallbacks(probeEnd)
+        mainHandler.removeCallbacks(fixLimit)
+        fixCancel?.cancel()
+        fixCancel = null
         HeadlessLocationEngine.destroyNow()
 
         location?.dispose()
@@ -466,10 +599,13 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
 
     fun isInForegroundMode(): Boolean = isForeground
 
-    /** 1: the mode runs and Dart owns it. 2: a native start runs unclaimed. 0: off. */
+    /**
+     * 1: the mode runs and Dart owns it. 2: a native start runs unclaimed.
+     * 0: off, or only a short fix run.
+     */
     fun backgroundModeAnswer(): Int =
         when {
-            !isForeground -> 0
+            !isForeground || fixRunOnly -> 0
             probeUnclaimed -> 2
             else -> 1
         }
@@ -507,82 +643,99 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
      * started service that the system restarts (sticky) after a process
      * kill, and it remembers the wish for the boot receiver. Starting a
      * service that is already in the foreground is allowed from any app
-     * state; a refusal only costs the restart, not the mode.
+     * state; a refusal only costs the restart, not the mode. A short fix run
+     * that is on becomes the mode.
      */
     fun enableBackgroundMode(): Boolean {
         if (isForeground) {
             Log.d(TAG, "Service already in foreground mode.")
+            if (fixRunOnly) adoptFixRun()
             return true
         }
         Log.d(TAG, "Start service in foreground mode.")
 
         val notification = backgroundNotification!!.build()
-        val foregroundServiceType =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            } else {
-                0
-            }
         try {
-            ServiceCompat.startForeground(this, ONGOING_NOTIFICATION_ID, notification, foregroundServiceType)
+            ServiceCompat.startForeground(this, ONGOING_NOTIFICATION_ID, notification, locationServiceType())
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start service in foreground mode.", e)
             return false
         }
 
         isForeground = true
+        markStarted()
+        return true
+    }
 
+    private fun locationServiceType(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+
+    /** A started, sticky service with the wish persisted: what outlives the process. */
+    private fun markStarted() {
         try {
             applicationContext.startService(Intent(applicationContext, FlutterLocationService::class.java).setAction(ACTION_START))
             prefs.edit().putBoolean(PREFS_KEY_WANTED, true).apply()
         } catch (e: Exception) {
             Log.w(TAG, "The foreground service could not be marked started; it will not outlive the process.", e)
         }
-        return true
     }
 
+    /**
+     * Stops the foreground and the started state. The headless engine stays:
+     * a Dart side that asked for this is still running its reconcile (the
+     * rest centre, the last points, the trip end) and ends its own run
+     * ([HeadlessLocationEngine.finish]).
+     */
     fun disableBackgroundMode() {
         Log.d(TAG, "Stop service in foreground.")
         probeUnclaimed = false
+        fixRunOnly = false
         mainHandler.removeCallbacks(probeEnd)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
-
-        isForeground = false
+        leaveForeground()
 
         prefs.edit().putBoolean(PREFS_KEY_WANTED, false).apply()
         cancelDartCheck()
         // Bound plugins keep the service alive; this only clears the started
         // state so the system never restarts it.
         stopSelf()
-        destroyHeadlessEngineLater()
+    }
+
+    private fun leaveForeground() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        isForeground = false
     }
 
     /**
      * A sticky restart or the boot receiver: the process is back without an
      * engine. Re-post the persisted notification, then bring a Dart consumer
      * up. A refusal (the permission is gone, the system declines the
-     * foreground start) stops the service so no orphan notification stays.
+     * foreground start) stops the service so no orphan notification stays,
+     * and a wake still tells Dart, which then sends what it can.
      */
-    private fun restoreForeground() {
+    private fun restoreForeground(fromBoot: Boolean) {
         if (isForeground) {
-            scheduleDartCheck(0)
+            if (!fixRunOnly) scheduleDartCheck(0)
             return
         }
-        if (!prefs.getBoolean(PREFS_KEY_WANTED, false) || !hasBackgroundLocationPermission(applicationContext)) {
+        val permitted = hasBackgroundLocationPermission(applicationContext)
+        if (!prefs.getBoolean(PREFS_KEY_WANTED, false) || !permitted) {
             Log.d(TAG, "Restarted without a wanted background mode or without the permission: stopping.")
             prefs.edit().putBoolean(PREFS_KEY_WANTED, false).apply()
-            stopSelf()
+            // The boot start is a foreground start: it must reach the
+            // foreground before it stops, or Android ends the app.
+            if (fromBoot && permitted) enterAndLeaveForeground() else stopSelf()
             return
         }
         if (!enableBackgroundMode()) {
+            // Android 12+ lists no exemption for a sticky restart.
             Log.w(TAG, "The system refused the foreground restart: stopping.")
             prefs.edit().putBoolean(PREFS_KEY_WANTED, false).apply()
             stopSelf()
+            WakeHub.enqueue(applicationContext, mapOf("kind" to "refresh", "ts" to System.currentTimeMillis().toDouble()))
             return
         }
         // A restored drive claims it; a phone at rest lets it go.
@@ -590,18 +743,36 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         scheduleDartCheck(0)
     }
 
+    /** A foreground start that has nothing to do: reach the foreground, then leave it. */
+    private fun enterAndLeaveForeground() {
+        try {
+            ServiceCompat.startForeground(this, ONGOING_NOTIFICATION_ID, backgroundNotification!!.buildFix(null, null), locationServiceType())
+            leaveForeground()
+        } catch (e: Exception) {
+            Log.w(TAG, "The foreground start could not be answered.", e)
+        }
+        stopSelf()
+    }
+
     /**
      * A drive signal: the foreground now, then a Dart consumer. No persisted
-     * wish is needed first: [enableBackgroundMode] persists it. A refusal
-     * stops the service at once, so the system never times the start out.
+     * wish is needed first: [enableBackgroundMode] persists it. A fix run
+     * that is on becomes the drive probe.
      */
     private fun startForDriveNow() {
         if (isForeground) {
-            // Dart's own service stays Dart's; an unclaimed one gets more time.
-            if (probeUnclaimed) openProbeWindow()
+            if (fixRunOnly) {
+                adoptFixRun()
+                openProbeWindow()
+            } else if (probeUnclaimed) {
+                // Dart's own service stays Dart's; an unclaimed one gets more time.
+                openProbeWindow()
+            }
             scheduleDartCheck(0)
             return
         }
+        // The grant was checked before the start; Android kills the process
+        // when it goes, so only a failed foreground start reaches this.
         if (!hasBackgroundLocationPermission(applicationContext) || !enableBackgroundMode()) {
             Log.w(TAG, "The drive start of the foreground service failed: stopping.")
             stopSelf()
@@ -609,6 +780,129 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         }
         openProbeWindow()
         scheduleDartCheck(0)
+    }
+
+    /**
+     * One fix for a wake. The foreground makes the app a foreground app for
+     * location, so the fix comes at once instead of a few times an hour. The
+     * run ends at the fix, inside the 10 s notification delay, unless the
+     * fix shows car speed (the run becomes the drive probe) or Dart claims
+     * the service meanwhile.
+     */
+    private fun runFix(raw: String?) {
+        val wake = parseWake(raw)
+        if (isForeground && !fixRunOnly) {
+            // The share streams already: the wake only tells Dart.
+            WakeHub.enqueue(applicationContext, wake)
+            return
+        }
+        if (fixRunOnly) {
+            // A fix is on its way; this wake rides it.
+            fixRunWakes.add(wake)
+            return
+        }
+        if (!hasBackgroundLocationPermission(applicationContext) || !enterForegroundForFix()) {
+            stopSelf()
+            WakeHub.enqueue(applicationContext, wake)
+            return
+        }
+        fixRunWakes.add(wake)
+        requestFix()
+    }
+
+    private fun enterForegroundForFix(): Boolean {
+        val notification = backgroundNotification?.buildFix(prefs.getString(PREFS_KEY_FIX_TITLE, null), prefs.getString(PREFS_KEY_FIX_BODY, null)) ?: return false
+        return try {
+            ServiceCompat.startForeground(this, ONGOING_NOTIFICATION_ID, notification, locationServiceType())
+            isForeground = true
+            fixRunOnly = true
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "The fix run could not enter the foreground.", e)
+            false
+        }
+    }
+
+    private fun requestFix() {
+        val cancel = CancellationTokenSource()
+        fixCancel = cancel
+        fixDone = false
+        mainHandler.removeCallbacks(fixLimit)
+        mainHandler.postDelayed(fixLimit, FIX_RUN_LIMIT_MS)
+        try {
+            val request =
+                CurrentLocationRequest.Builder()
+                    .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                    .setDurationMillis(FIX_RUN_MS)
+                    .setMaxUpdateAgeMillis(FIX_MAX_AGE_MS)
+                    .build()
+            LocationServices.getFusedLocationProviderClient(applicationContext)
+                .getCurrentLocation(request, cancel.token)
+                .addOnCompleteListener { task -> finishFix(if (task.isSuccessful) task.result else null) }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No location permission for the fix run.", e)
+            finishFix(null)
+        }
+    }
+
+    /** Once per run: the fix (or none) goes to Dart with every wake that waited for it. */
+    private fun finishFix(fix: Location?) {
+        if (fixDone) return
+        fixDone = true
+        mainHandler.removeCallbacks(fixLimit)
+        fixCancel?.cancel()
+        fixCancel = null
+        val app = applicationContext
+        val wakes = fixRunWakes.toList()
+        fixRunWakes.clear()
+        if (fix != null && fix.hasAccuracy() && fix.accuracy <= WakeMonitor.LEASH_MAX_ACCURACY_M) {
+            WakeMonitor.setLeash(app, fix.latitude, fix.longitude)
+        }
+        val point = fix?.let { WakeHub.pointOf(it) } ?: emptyMap()
+        val drive = fix != null && fix.hasSpeed() && fix.speed >= WakeMonitor.driveSpeedMps(app)
+        if (drive) {
+            if (fixRunOnly) {
+                adoptFixRun()
+                openProbeWindow()
+                scheduleDartCheck(0)
+            }
+            WakeHub.enqueue(app, point + ("kind" to "drive") + ("fixRun" to true) + ("ts" to System.currentTimeMillis().toDouble()))
+            return
+        }
+        if (fixRunOnly) {
+            fixRunOnly = false
+            leaveForeground()
+            stopSelf()
+        }
+        for (wake in wakes) WakeHub.enqueue(app, wake + point + ("fixRun" to true))
+    }
+
+    /** The fix run becomes the mode: a drive signal, a drive fix, or a Dart claim. */
+    private fun adoptFixRun() {
+        fixRunOnly = false
+        markStarted()
+        // The drive copy, not the fix copy.
+        try {
+            backgroundNotification?.let { NotificationManagerCompat.from(this).notify(ONGOING_NOTIFICATION_ID, it.build()) }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "The drive notification could not replace the fix notification.", e)
+        }
+    }
+
+    private fun parseWake(raw: String?): Map<String, Any?> {
+        if (raw.isNullOrEmpty()) return mapOf("kind" to "refresh", "ts" to System.currentTimeMillis().toDouble())
+        return try {
+            val json = JSONObject(raw)
+            val out = HashMap<String, Any?>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                out[key] = json.opt(key)?.takeUnless { it == JSONObject.NULL }
+            }
+            out
+        } catch (e: JSONException) {
+            mapOf("kind" to "refresh", "ts" to System.currentTimeMillis().toDouble())
+        }
     }
 
     /** The Dart entry point the headless engine runs; a raw `PluginUtilities` callback handle. */
@@ -639,7 +933,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         if (consumer !== plugin) return
         consumer = null
         location?.onConsumerGone()
-        if (isForeground && !hasForegroundEngine) scheduleDartCheck(DART_CHECK_DELAY_MS)
+        if (isForeground && !fixRunOnly && !hasForegroundEngine) scheduleDartCheck(DART_CHECK_DELAY_MS)
     }
 
     private fun scheduleDartCheck(delayMs: Long) {
@@ -658,7 +952,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
      * keep a notification for nothing.
      */
     private fun ensureDartConsumer() {
-        if (!isForeground || consumer != null || HeadlessLocationEngine.isRunning || hasForegroundEngine) return
+        if (!isForeground || fixRunOnly || consumer != null || HeadlessLocationEngine.isRunning || hasForegroundEngine) return
         val handle = prefs.getLong(PREFS_KEY_CALLBACK, 0L)
         if (handle == 0L) {
             Log.w(TAG, "No headless entry registered: stopping the foreground service.")
@@ -667,15 +961,6 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         }
         Log.d(TAG, "No Dart consumer: starting the headless engine.")
         if (!HeadlessLocationEngine.startIfNone(applicationContext, handle)) disableBackgroundMode()
-    }
-
-    /**
-     * Posted, never inline: `disableBackgroundMode()` runs from a method call
-     * handled ON the headless engine, and its result must reach Dart before
-     * that engine goes.
-     */
-    private fun destroyHeadlessEngineLater() {
-        HeadlessLocationEngine.destroyLater(mainHandler)
     }
 
     fun changeNotificationOptions(options: NotificationOptions): Map<String, Any>? {

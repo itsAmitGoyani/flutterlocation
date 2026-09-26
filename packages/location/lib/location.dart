@@ -164,11 +164,13 @@ class Location implements LocationPlatform {
   /// the app's Flutter engine: a swipe-away, a process kill, a reboot or an
   /// app update while [enableBackgroundMode] is on.
   ///
-  /// Register on every start: the handle changes with every build. Returns
+  /// Register on every start. The handle comes from the function's name and
+  /// library, so it survives an update unless the function moves. Returns
   /// false where nothing runs headless (iOS, macOS, web) and when
   /// [entryPoint] is not a top-level or static function.
   Future<bool> registerHeadlessEntry(Function entryPoint) async {
-    final CallbackHandle? handle = PluginUtilities.getCallbackHandle(entryPoint);
+    final CallbackHandle? handle =
+        PluginUtilities.getCallbackHandle(entryPoint);
     if (handle == null) {
       return false;
     }
@@ -189,20 +191,29 @@ class Location implements LocationPlatform {
   /// Android: a leash geofence, the activity transitions (with the Motion
   /// permission) and a heartbeat alarm every [heartbeatMs] that Doze allows.
   /// A vehicle transition, or a leash exit faster than [driveSpeedMps],
-  /// starts the foreground service for a drive; every other event reaches
-  /// the handler of [setWakeHandler] without a service. The boot receiver
-  /// re-arms them after a reboot or an app update.
+  /// starts the foreground service for a drive. A leash exit, a stop and a
+  /// parked car take one fix in a short foreground run first, which ends
+  /// before Android shows its notification ([fixTitle], [fixBody] are its
+  /// copy where a phone shows it at once). Every event reaches the handler
+  /// of [setWakeHandler]. The boot receiver re-arms them after a reboot or
+  /// an app update; [restoreServiceAtBoot] false (the drive-only mode) makes
+  /// it take one fix instead of restoring the service.
   ///
   /// [latitude] and [longitude] put the leash on the spot where the app goes
-  /// to sleep. Returns false without the background location grant.
+  /// to sleep. Returns false without the background location grant. iOS
+  /// arms without the leash under approximate location (region monitoring
+  /// needs precise location) and still returns true.
   Future<bool> setRelaunchMonitoring({
     required bool enable,
     int? heartbeatMs,
     double? driveSpeedMps,
     double? latitude,
     double? longitude,
-  }) {
-    return _invokeFlag(
+    bool? restoreServiceAtBoot,
+    String? fixTitle,
+    String? fixBody,
+  }) async {
+    final int value = await _invokeInt(
       'setRelaunchMonitoring',
       <String, Object?>{
         'enable': enable,
@@ -210,44 +221,74 @@ class Location implements LocationPlatform {
         if (driveSpeedMps != null) 'driveSpeedMps': driveSpeedMps,
         if (latitude != null && longitude != null) 'latitude': latitude,
         if (latitude != null && longitude != null) 'longitude': longitude,
+        if (restoreServiceAtBoot != null)
+          'restoreServiceAtBoot': restoreServiceAtBoot,
+        if (fixTitle != null) 'fixTitle': fixTitle,
+        if (fixBody != null) 'fixBody': fixBody,
       },
     );
+    return value >= 1;
   }
 
   static Future<void> Function(Map<String, Object?> wake)? _wakeHandler;
+  static Future<void> Function()? _locationLaunchHandler;
 
   /// Android only. Makes this engine's Dart side the one that takes the
-  /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat` or
-  /// `refresh`, and a leash wake carries the point of its exit
-  /// (`latitude`, `longitude`, `accuracy`, `speed`, `heading`, `time`). The
-  /// wake counts as done when [handler] completes. Null stops listening.
+  /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat`,
+  /// `refresh` or `boot`. A wake can carry a point (`latitude`, `longitude`,
+  /// `accuracy`, `speed`, `heading`, `time`): the exit point of a leash, or
+  /// the fix of a short foreground run (`fixRun` true). A heartbeat carries
+  /// `leashOk`, false while Play services holds no leash. The wake counts as
+  /// done when [handler] completes. Null stops listening.
   Future<bool> setWakeHandler(
     Future<void> Function(Map<String, Object?> wake)? handler,
   ) {
     _wakeHandler = handler;
-    if (handler == null) {
-      _forkChannel.setMethodCallHandler(null);
-      return _invokeFlag('stopListeningForWakes');
-    }
-    _forkChannel.setMethodCallHandler(_onPlatformCall);
-    return _invokeFlag('listenForWakes');
+    _syncPlatformCallHandler();
+    return _invokeFlag(
+      handler == null ? 'stopListeningForWakes' : 'listenForWakes',
+    );
+  }
+
+  /// iOS only. Runs [handler] when the plugin finds that iOS launched or
+  /// woke the app in the background for a location event (a leash exit, a
+  /// visit, a significant change). A UIScene app gets no launch options, so
+  /// the event itself is the signal; the plugin has already started the
+  /// updates that keep the app running. Null stops listening.
+  void setLocationLaunchHandler(Future<void> Function()? handler) {
+    _locationLaunchHandler = handler;
+    _syncPlatformCallHandler();
+  }
+
+  static void _syncPlatformCallHandler() {
+    final bool any = _wakeHandler != null || _locationLaunchHandler != null;
+    _forkChannel.setMethodCallHandler(any ? _onPlatformCall : null);
   }
 
   static Future<Object?> _onPlatformCall(MethodCall call) async {
-    if (call.method != 'onWake') {
-      throw MissingPluginException('No handler for ${call.method}');
+    switch (call.method) {
+      case 'onWake':
+        final Future<void> Function(Map<String, Object?> wake)? handler =
+            _wakeHandler;
+        if (handler == null) {
+          return 0;
+        }
+        final Object? raw = call.arguments;
+        final Map<String, Object?> wake = raw is Map
+            ? raw.map((k, v) => MapEntry<String, Object?>('$k', v))
+            : <String, Object?>{};
+        await handler(wake);
+        return 1;
+      case 'onLocationLaunch':
+        final Future<void> Function()? handler = _locationLaunchHandler;
+        if (handler == null) {
+          return 0;
+        }
+        await handler();
+        return 1;
+      default:
+        throw MissingPluginException('No handler for ${call.method}');
     }
-    final Future<void> Function(Map<String, Object?> wake)? handler =
-        _wakeHandler;
-    if (handler == null) {
-      return 0;
-    }
-    final Object? raw = call.arguments;
-    final Map<String, Object?> wake = raw is Map
-        ? raw.map((Object? k, Object? v) => MapEntry<String, Object?>('$k', v))
-        : <String, Object?>{};
-    await handler(wake);
-    return 1;
   }
 
   /// Android only. Asks for a wake of [kind] on the engine that shares; the
@@ -257,10 +298,56 @@ class Location implements LocationPlatform {
   }
 
   /// iOS only. True when the system launched this process for a location
-  /// event (`UIApplication.LaunchOptionsKey.location`): the app runs in the
+  /// event: the launch key (hosts without UIScene), a location event the
+  /// plugin already received, or a launch into the background with the
+  /// relaunch monitors armed and no scene. The app then runs in the
   /// background with no UI and should start its location work itself.
   Future<bool> wasLaunchedByLocationEvent() {
     return _invokeFlag('wasLaunchedByLocationEvent');
+  }
+
+  /// iOS only. False before the first unlock after a reboot: files and
+  /// keychain items with the default protection cannot be read, so the
+  /// app's stored session reads as empty. True elsewhere.
+  Future<bool> isProtectedDataAvailable() async {
+    return await _invokeInt('isProtectedDataAvailable', null, 1) == 1;
+  }
+
+  /// The background mode as the platform runs it: 0 off (or only a short
+  /// fix run), 1 on and claimed by Dart, 2 on after a native start (a drive
+  /// signal, a restart) that Dart has not claimed yet (Android).
+  Future<int> backgroundModeState() {
+    return _invokeInt('backgroundModeState');
+  }
+
+  /// Android only. The headless engine's Dart side ended its run: the plugin
+  /// destroys that engine right after this answer. A call from any other
+  /// engine does nothing and returns false.
+  Future<bool> finishHeadlessRun() {
+    return _invokeFlag('finishHeadlessRun');
+  }
+
+  /// Android only. One fix, bounded by [timeoutMs]: Play services ends the
+  /// request at the limit, so nothing stays on without a fix. A fix up to
+  /// a minute old serves. The point (`latitude`, `longitude`, `accuracy`,
+  /// `speed`, `heading`, `time`), or null when no fix came.
+  Future<Map<String, Object?>?> getCurrentFix({
+    int timeoutMs = 10000,
+    bool highAccuracy = false,
+  }) async {
+    try {
+      final Map<Object?, Object?>? raw =
+          await _forkChannel.invokeMethod<Map<Object?, Object?>>(
+        'getCurrentFix',
+        <String, Object?>{
+          'timeoutMs': timeoutMs,
+          'highAccuracy': highAccuracy,
+        },
+      );
+      return raw?.map((k, v) => MapEntry<String, Object?>('$k', v));
+    } on MissingPluginException {
+      return null;
+    }
   }
 
   /// Whether location may be read from the background: Always on iOS,
@@ -275,12 +362,20 @@ class Location implements LocationPlatform {
     String method, [
     Map<String, Object?>? arguments,
   ]) async {
+    return await _invokeInt(method, arguments) == 1;
+  }
+
+  Future<int> _invokeInt(
+    String method, [
+    Map<String, Object?>? arguments,
+    int missing = 0,
+  ]) async {
     try {
       final int? value =
           await _forkChannel.invokeMethod<int>(method, arguments);
-      return value == 1;
+      return value ?? missing;
     } on MissingPluginException {
-      return false;
+      return missing;
     }
   }
 }

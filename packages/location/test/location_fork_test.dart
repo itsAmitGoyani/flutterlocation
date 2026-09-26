@@ -68,9 +68,9 @@ void main() {
 
   test('setWakeHandler listens and answers a native wake when it completes',
       () async {
-    final List<Map<String, Object?>> received = <Map<String, Object?>>[];
+    final received = <Map<String, Object?>>[];
     expect(
-      await Location().setWakeHandler((Map<String, Object?> wake) async {
+      await Location().setWakeHandler((wake) async {
         received.add(wake);
       }),
       isTrue,
@@ -87,7 +87,7 @@ void main() {
           'longitude': 72.0,
         }),
       ),
-      (ByteData? _) {},
+      (_) {},
     );
     expect(const StandardMethodCodec().decodeEnvelope(reply!), 1);
     expect(received.single['kind'], 'leash');
@@ -111,6 +111,95 @@ void main() {
   test('isBackgroundPermissionGranted reads 1 as true', () async {
     expect(await Location().isBackgroundPermissionGranted(), isTrue);
     expect(calls.single.method, 'isBackgroundPermissionGranted');
+  });
+
+  test('setRelaunchMonitoring reads 2 (armed without the leash) as armed',
+      () async {
+    answer = 2;
+    expect(await Location().setRelaunchMonitoring(enable: true), isTrue);
+    answer = 0;
+    expect(await Location().setRelaunchMonitoring(enable: true), isFalse);
+  });
+
+  test('setRelaunchMonitoring passes the boot rule and the fix copy', () async {
+    await Location().setRelaunchMonitoring(
+      enable: true,
+      restoreServiceAtBoot: false,
+      fixTitle: 'Updating your location',
+      fixBody: 'Members can see where you are',
+    );
+    final Map<Object?, Object?> args = calls.single.arguments as Map;
+    expect(args['restoreServiceAtBoot'], isFalse);
+    expect(args['fixTitle'], 'Updating your location');
+    expect(args['fixBody'], 'Members can see where you are');
+  });
+
+  Future<Object?> platformCall(String method, [Object? arguments]) async {
+    final ByteData? reply = await TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      'lyokone/location',
+      const StandardMethodCodec()
+          .encodeMethodCall(MethodCall(method, arguments)),
+      (_) {},
+    );
+    return const StandardMethodCodec().decodeEnvelope(reply!);
+  }
+
+  test('the location launch handler runs on a native location event', () async {
+    var launches = 0;
+    Location().setLocationLaunchHandler(() async => launches++);
+    expect(await platformCall('onLocationLaunch'), 1);
+    expect(launches, 1);
+    Location().setLocationLaunchHandler(null);
+  });
+
+  test('the launch handler and the wake handler share the channel', () async {
+    var launches = 0;
+    Location().setLocationLaunchHandler(() async => launches++);
+    await Location().setWakeHandler((wake) async {});
+    await Location().setWakeHandler(null);
+    // Dropping the wake handler keeps the launch handler.
+    expect(await platformCall('onLocationLaunch'), 1);
+    expect(launches, 1);
+    expect(await platformCall('onWake', <String, Object?>{'kind': 'x'}), 0);
+    Location().setLocationLaunchHandler(null);
+  });
+
+  test('backgroundModeState passes the raw state through', () async {
+    answer = 2;
+    expect(await Location().backgroundModeState(), 2);
+    expect(calls.single.method, 'backgroundModeState');
+  });
+
+  test('finishHeadlessRun asks the plugin', () async {
+    expect(await Location().finishHeadlessRun(), isTrue);
+    expect(calls.single.method, 'finishHeadlessRun');
+  });
+
+  test('isProtectedDataAvailable reads 0 as false and a missing plugin as true',
+      () async {
+    answer = 0;
+    expect(await Location().isProtectedDataAvailable(), isFalse);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+    expect(await Location().isProtectedDataAvailable(), isTrue);
+  });
+
+  test('getCurrentFix returns the point, or null when no fix came', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return <String, Object?>{'latitude': 23.0, 'longitude': 72.0};
+    });
+    final Map<String, Object?>? fix =
+        await Location().getCurrentFix(timeoutMs: 5000, highAccuracy: true);
+    expect(fix?['latitude'], 23.0);
+    expect((calls.single.arguments as Map)['timeoutMs'], 5000);
+    expect((calls.single.arguments as Map)['highAccuracy'], isTrue);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async => null);
+    expect(await Location().getCurrentFix(), isNull);
   });
 
   test('a platform without the plugin answers false', () async {
