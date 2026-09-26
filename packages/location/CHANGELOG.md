@@ -33,6 +33,13 @@
 
 ### 🐛 Bug fixes
 
+- **iOS:** `changeSettings` maps the accuracy by its index. The upstream
+  lookup used string keys for a number, so every profile ran at accuracy 0
+  (the best, GPS at full power) and auto-pause was always off whatever Dart
+  asked. `changeSettings` answers 0 with location services off instead of
+  never. `isBackgroundModeEnabled` answers once. The leash moves at most
+  every 30 s from delivered fixes, and at once on an exit; the relaunch
+  watchdog waits 90 s.
 - **Android:** the plugin binds the service from the engine with the
   application context, not from the Activity, and every permission read and
   location request works with no Activity attached; only the prompt, the

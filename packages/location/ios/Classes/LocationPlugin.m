@@ -29,6 +29,9 @@
 // Ordinary updates the plugin started by itself at a relaunch, before Dart listens.
 @property(assign, nonatomic) BOOL keepAliveUpdates;
 @property(strong, nonatomic) NSTimer *dartWatchdog;
+// When the leash last moved: a delivered fix moves it at most every
+// kLeashRecenterMinIntervalSeconds, since a drive delivers one each second.
+@property(assign, nonatomic) NSTimeInterval lastLeashMoveAt;
 @end
 
 static NSString *const kRelaunchArmedKey = @"lyokone_location_relaunch_armed";
@@ -40,9 +43,11 @@ static NSString *const kLeashIdentifier = @"lyokone.location.leash";
 static const CLLocationDistance kLeashRadiusMeters = 150.0;
 static const CLLocationDistance kLeashRecenterMeters = 75.0;
 static const CLLocationAccuracy kLeashMaxAccuracyMeters = 200.0;
+static const NSTimeInterval kLeashRecenterMinIntervalSeconds = 30.0;
 // How long a relaunched process keeps its own updates before it decides the
-// Dart side never came.
-static const NSTimeInterval kDartWatchdogSeconds = 60.0;
+// Dart side never came. The Dart launch waits up to 20 s for Firebase and
+// Remote Config on such a launch, and then starts the share.
+static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 
 @implementation LocationPlugin
 
@@ -101,37 +106,34 @@ static const NSTimeInterval kDartWatchdogSeconds = 60.0;
     NSLog(@"[Location] changeSettings(%@)", call.arguments);
 #endif
     if ([CLLocationManager locationServicesEnabled]) {
-      CLLocationAccuracy reducedAccuracy = kCLLocationAccuracyHundredMeters;
-      if (@available(iOS 14, *)) {
-        reducedAccuracy = kCLLocationAccuracyReduced;
-      }
-      NSDictionary *dictionary = @{
-        @"0" : @(kCLLocationAccuracyKilometer),
-        @"1" : @(kCLLocationAccuracyHundredMeters),
-        @"2" : @(kCLLocationAccuracyNearestTenMeters),
-        @"3" : @(kCLLocationAccuracyBest),
-        @"4" : @(kCLLocationAccuracyBestForNavigation),
-        @"5" : @(reducedAccuracy)
-      };
-
+      // AutoLNK: Dart sends the accuracy as the LocationAccuracy index, a
+      // number. Upstream looked it up in a dictionary keyed by strings, so the
+      // lookup always failed, and every profile ran at accuracy 0, the best
+      // one: GPS at full power, a still phone included. The same failed
+      // lookup turned auto-pause off whatever Dart asked for.
       self.clLocationManager.desiredAccuracy =
-          [dictionary[call.arguments[@"accuracy"]] doubleValue];
-      double distanceFilter = [call.arguments[@"distanceFilter"] doubleValue];
+          [self accuracyForIndex:call.arguments[@"accuracy"]];
+      id filter = call.arguments[@"distanceFilter"];
+      double distanceFilter =
+          [filter isKindOfClass:[NSNumber class]] ? [filter doubleValue] : 0;
       if (distanceFilter == 0) {
         distanceFilter = kCLDistanceFilterNone;
       }
       self.clLocationManager.distanceFilter = distanceFilter;
+      id pauses = call.arguments[@"pausesLocationUpdatesAutomatically"];
       self.clLocationManager.pausesLocationUpdatesAutomatically =
-          [dictionary[call.arguments[@"pausesLocationUpdatesAutomatically"]]
-              boolValue];
+          [pauses isKindOfClass:[NSNumber class]] ? [pauses boolValue] : NO;
       result(@1);
+    } else {
+      // Never leave the Dart call without an answer.
+      result(@0);
     }
   } else if ([call.method isEqualToString:@"isBackgroundModeEnabled"]) {
+    // AutoLNK: one answer. Upstream answered twice on iOS 9 and later, and
+    // not at all without the location background mode.
     if (self.applicationHasLocationBackgroundMode) {
-      if (@available(iOS 9.0, *)) {
-        result(self.clLocationManager.allowsBackgroundLocationUpdates ? @1
-                                                                      : @0);
-      }
+      result(self.clLocationManager.allowsBackgroundLocationUpdates ? @1 : @0);
+    } else {
       result(@0);
     }
   } else if ([call.method isEqualToString:@"enableBackgroundMode"]) {
@@ -285,6 +287,30 @@ static const NSTimeInterval kDartWatchdogSeconds = 60.0;
     result(@0);
   } else {
     result(FlutterMethodNotImplemented);
+  }
+}
+
+// The LocationAccuracy index Dart sends, as a Core Location accuracy:
+// powerSave, low, balanced, high, navigation, reduced.
+- (CLLocationAccuracy)accuracyForIndex:(id)index {
+  NSInteger value =
+      [index isKindOfClass:[NSNumber class]] ? [index integerValue] : 3;
+  switch (value) {
+    case 0:
+      return kCLLocationAccuracyKilometer;
+    case 1:
+      return kCLLocationAccuracyHundredMeters;
+    case 2:
+      return kCLLocationAccuracyNearestTenMeters;
+    case 4:
+      return kCLLocationAccuracyBestForNavigation;
+    case 5:
+      if (@available(iOS 14, *)) {
+        return kCLLocationAccuracyReduced;
+      }
+      return kCLLocationAccuracyHundredMeters;
+    default:
+      return kCLLocationAccuracyBest;
   }
 }
 
@@ -558,14 +584,29 @@ static const NSTimeInterval kDartWatchdogSeconds = 60.0;
   region.notifyOnExit = YES;
   [manager startMonitoringForRegion:region];
   self.leash = region;
+  self.lastLeashMoveAt = [NSProcessInfo processInfo].systemUptime;
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
   [defaults setDouble:centre.latitude forKey:kLeashLatitudeKey];
   [defaults setDouble:centre.longitude forKey:kLeashLongitudeKey];
 }
 
 // Per delivered fix: one distance, and a new region only past the
-// re-centre distance (about every 75 m of travel, never while still).
+// re-centre distance and at most every kLeashRecenterMinIntervalSeconds, so
+// a drive does not replace the region and write its centre every second.
 - (void)recenterLeashIfNeeded:(CLLocation *)location {
+  if (!self.relaunchArmed || location == nil) {
+    return;
+  }
+  if ([NSProcessInfo processInfo].systemUptime - self.lastLeashMoveAt <
+      kLeashRecenterMinIntervalSeconds) {
+    return;
+  }
+  [self moveLeashTo:location];
+}
+
+// Moves the leash to a usable fix beyond the re-centre distance, with no
+// time limit: an exit must move it at once.
+- (void)moveLeashTo:(CLLocation *)location {
   if (!self.relaunchArmed || location == nil) {
     return;
   }
@@ -666,7 +707,7 @@ static const NSTimeInterval kDartWatchdogSeconds = 60.0;
   // The wake itself is the value: a relaunched app starts updates in
   // didFinishLaunching, a running one already streams. Re-centre where
   // the system says the phone is now, so the next exit is a real move.
-  [self recenterLeashIfNeeded:manager.location];
+  [self moveLeashTo:manager.location];
 }
 
 - (void)locationManager:(CLLocationManager *)manager
