@@ -3,6 +3,7 @@ package com.lyokone.location
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import androidx.work.Worker
 import androidx.work.WorkerParameters
@@ -20,19 +21,30 @@ class WakeWorker(
     params: WorkerParameters,
 ) : Worker(context, params) {
     override fun doWork(): Result {
-        val latch = CountDownLatch(1)
-        val done: () -> Unit = { latch.countDown() }
-        val main = Handler(Looper.getMainLooper())
-        main.post { WakeHub.drainForJob(applicationContext, done) }
-        if (!latch.await(TIME_LIMIT_S, TimeUnit.SECONDS)) {
-            Log.w(TAG, "The wakes did not finish in time; the next job delivers the rest.")
-            main.post { WakeHub.abandon(done) }
+        // WorkManager's in-process scheduler starts this job with no wake
+        // lock, and the push, alarm or broadcast that woke the app lets the
+        // CPU sleep as soon as it returns: the fix and the upload need one.
+        val awake = (applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+        awake.setReferenceCounted(false)
+        awake.acquire(TimeUnit.SECONDS.toMillis(TIME_LIMIT_S + 5))
+        try {
+            val latch = CountDownLatch(1)
+            val done: () -> Unit = { latch.countDown() }
+            val main = Handler(Looper.getMainLooper())
+            main.post { WakeHub.drainForJob(applicationContext, done) }
+            if (!latch.await(TIME_LIMIT_S, TimeUnit.SECONDS)) {
+                Log.w(TAG, "The wakes did not finish in time; the next job delivers the rest.")
+                main.post { WakeHub.abandon(done) }
+            }
+            return Result.success()
+        } finally {
+            if (awake.isHeld) awake.release()
         }
-        return Result.success()
     }
 
     private companion object {
         const val TAG = "WakeWorker"
         const val TIME_LIMIT_S = 60L
+        const val WAKE_LOCK_TAG = "lyokone:WakeWorker"
     }
 }

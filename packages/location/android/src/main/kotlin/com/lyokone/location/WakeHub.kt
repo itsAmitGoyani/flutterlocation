@@ -1,11 +1,15 @@
 package com.lyokone.location
 
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONArray
@@ -31,6 +35,7 @@ internal object WakeHub {
     private const val KEY_QUEUE = "wake_queue"
     private const val MAX_QUEUE = 16
     private const val UNIQUE_WORK = "lyokone_location_wake"
+    private const val UNIQUE_WORK_NETWORK = "lyokone_location_wake_net"
 
     /** A wake older than this is dropped: its news is stale, and a newer wake follows. */
     private const val MAX_AGE_MS = 15 * 60 * 1000L
@@ -100,14 +105,32 @@ internal object WakeHub {
             writeQueue(app, queue)
         }
         try {
-            WorkManager.getInstance(app).enqueueUniqueWork(
-                UNIQUE_WORK,
-                ExistingWorkPolicy.APPEND_OR_REPLACE,
-                OneTimeWorkRequest.Builder(WakeWorker::class.java).build(),
-            )
+            val (name, request) = jobFor(wake["kind"])
+            WorkManager.getInstance(app).enqueueUniqueWork(name, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
         } catch (e: Exception) {
             Log.e(TAG, "The wake job could not be scheduled.", e)
         }
+    }
+
+    /**
+     * The job for one wake. On Android 12+ a wake that uploads runs as an
+     * expedited job that needs a network: Doze lets such a job run and reach
+     * the network, and its quota is free while the push, alarm or broadcast
+     * that woke the app keeps it on the temporary allowlist. Out of quota it
+     * runs as a plain job. A drive wake never waits for a network, because
+     * its service stops unless Dart claims it within three minutes. Below
+     * Android 12 an expedited job is a foreground service with a
+     * notification, so the job stays plain there.
+     */
+    private fun jobFor(kind: Any?): Pair<String, OneTimeWorkRequest> {
+        val builder = OneTimeWorkRequest.Builder(WakeWorker::class.java)
+        if (kind == "drive" || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return UNIQUE_WORK to builder.build()
+        val network = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+        return UNIQUE_WORK_NETWORK to
+            builder
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .setConstraints(network)
+                .build()
     }
 
     /** From the job: delivers the queue; [done] runs once it is empty or nobody can take it. */

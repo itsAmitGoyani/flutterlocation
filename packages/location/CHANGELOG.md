@@ -48,6 +48,13 @@
   that arrive before the service connects are queued instead of failing.
   A destroyed engine stops the fused updates it asked for. A refused
   foreground start (Android 12+) answers 0 instead of crashing.
+- **Android:** a wake finishes its fix and its upload in Doze. The wake job
+  holds a partial wake lock for its 60 s limit; before, the CPU could sleep
+  as soon as the push, alarm or broadcast that woke the app returned. On
+  Android 12+ every wake except a drive runs as an expedited job that needs a
+  network, because Doze lets only such a job run and reach the network; out
+  of quota it runs as a plain job. A drive wake stays a plain job that never
+  waits for a network.
 
 ## 8.0.1
 
