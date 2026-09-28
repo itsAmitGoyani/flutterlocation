@@ -202,6 +202,35 @@ void main() {
     expect(await Location().getCurrentFix(), isNull);
   });
 
+  test('locationPushToken returns the hex token, null without the plugin',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return 'ab01ff';
+    });
+    expect(await Location().locationPushToken(), 'ab01ff');
+    expect(calls.single.method, 'startMonitoringLocationPushes');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async => null);
+    expect(await Location().locationPushToken(), isNull);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+    expect(await Location().locationPushToken(), isNull);
+  });
+
+  test('locationPushToken surfaces the platform error code', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      throw PlatformException(code: '3', message: 'no entitlement');
+    });
+    await expectLater(
+      Location().locationPushToken(),
+      throwsA(isA<PlatformException>()
+          .having((e) => e.code, 'code', '3')),
+    );
+  });
+
   test('a platform without the plugin answers false', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);

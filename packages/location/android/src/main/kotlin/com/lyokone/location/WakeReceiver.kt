@@ -14,6 +14,7 @@ import com.google.android.gms.location.DetectedActivity
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofenceStatusCodes
 import com.google.android.gms.location.GeofencingEvent
+import com.google.android.gms.location.LocationResult
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -55,6 +56,7 @@ class WakeReceiver : BroadcastReceiver() {
                 WakeMonitor.ACTION_HEARTBEAT -> onHeartbeat(app, finish)
                 WakeMonitor.ACTION_GEOFENCE -> onGeofence(app, intent, finish)
                 WakeMonitor.ACTION_TRANSITION -> onTransition(app, intent, finish)
+                WakeMonitor.ACTION_FIX -> onFix(app, intent, finish)
                 else -> finish()
             }
         } catch (e: Exception) {
@@ -135,6 +137,28 @@ class WakeReceiver : BroadcastReceiver() {
         val rests = (last.activityType == DetectedActivity.STILL && last.isEnter()) || (last.activityType == DetectedActivity.IN_VEHICLE && !last.isEnter())
         if (rests && FlutterLocationService.startForFix(app, wake)) return finish()
         WakeHub.enqueue(app, wake, finish)
+    }
+
+    /**
+     * One of the fused provider's own background fixes at rest: a real point
+     * without a service. At car speed it starts the drive, like a leash exit.
+     */
+    private fun onFix(
+        app: Context,
+        intent: Intent,
+        finish: () -> Unit,
+    ) {
+        if (!LocationResult.hasResult(intent)) return finish()
+        val location = LocationResult.extractResult(intent)?.lastLocation ?: return finish()
+        if (FlutterLocationService.isForegroundNow()) return finish()
+        // The leash follows the phone under its own rules (accuracy, spacing).
+        WakeMonitor.onFix(app, location)
+        val point = WakeHub.pointOf(location)
+        if (location.hasSpeed() && location.speed >= WakeMonitor.driveSpeedMps(app) && FlutterLocationService.startForDrive(app)) {
+            WakeHub.enqueue(app, point + ("kind" to "drive") + ("ts" to now()), finish)
+            return
+        }
+        WakeHub.enqueue(app, point + ("kind" to "fix") + ("ts" to now()), finish)
     }
 
     /**

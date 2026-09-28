@@ -235,9 +235,10 @@ class Location implements LocationPlatform {
 
   /// Android only. Makes this engine's Dart side the one that takes the
   /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat`,
-  /// `refresh` or `boot`. A wake can carry a point (`latitude`, `longitude`,
-  /// `accuracy`, `speed`, `heading`, `time`): the exit point of a leash, or
-  /// the fix of a short foreground run (`fixRun` true). A heartbeat carries
+  /// `refresh`, `boot` or `fix`. A wake can carry a point (`latitude`,
+  /// `longitude`, `accuracy`, `speed`, `heading`, `time`): the exit point of
+  /// a leash, one of the fused provider's own background fixes at rest
+  /// (`fix`), or the fix of a short foreground run (`fixRun` true). A heartbeat carries
   /// `leashOk`, false while Play services holds no leash. The wake counts as
   /// done when [handler] completes. Null stops listening.
   Future<bool> setWakeHandler(
@@ -356,6 +357,24 @@ class Location implements LocationPlatform {
   /// service is bound.
   Future<bool> isBackgroundPermissionGranted() {
     return _invokeFlag('isBackgroundPermissionGranted');
+  }
+
+  /// iOS only. Registers for Apple's location pushes and returns the token
+  /// (hex) a server passes to APNs for the topic `<bundle id>.location-query`.
+  /// A location push runs the app's Location Push Service Extension even
+  /// while the app is terminated. Needs the `com.apple.developer.location.push`
+  /// entitlement, the extension target, Always and an internet connection.
+  /// The token can change, so ask on every start. Null on Android, on a
+  /// platform without the plugin and below iOS 15. A [PlatformException]
+  /// carries the `CLLocationPushServiceError` code: 1 no extension, 2 no
+  /// push environment, 3 no entitlement, 4 unsupported platform.
+  Future<String?> locationPushToken() async {
+    try {
+      return await _forkChannel
+          .invokeMethod<String>('startMonitoringLocationPushes');
+    } on MissingPluginException {
+      return null;
+    }
   }
 
   Future<bool> _invokeFlag(

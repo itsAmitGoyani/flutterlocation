@@ -112,6 +112,10 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
                 // An iOS fact (data protection before the first unlock).
                 result.success(1);
                 return;
+            case "startMonitoringLocationPushes":
+                // An iOS fact (Apple's location pushes): Android has no token.
+                result.success(null);
+                return;
             case "finishHeadlessRun":
                 onFinishHeadlessRun(result);
                 return;

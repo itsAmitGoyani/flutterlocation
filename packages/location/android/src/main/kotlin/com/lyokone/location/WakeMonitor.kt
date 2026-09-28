@@ -18,21 +18,26 @@ import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.DetectedActivity
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingRequest
+import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 
 /**
  * The system events that wake a sleeping app at rest (Android, AutoLNK fork).
  *
  * The foreground service runs only while the app needs continuous GPS in the
  * background: a drive. At rest the app holds no service and no location
- * request, so Android shows no notification. Three sources wake it instead.
- * The system holds all three, so they outlive the process and a swipe from
- * Recents:
+ * request of its own, so Android shows no notification. Four sources wake it
+ * instead. The system holds all four, so they outlive the process and a
+ * swipe from Recents:
  *
  * - a "leash" geofence around the phone: an exit means the phone moved;
  * - activity transitions (vehicle, foot, bicycle, still), with the Motion
  *   permission;
- * - a heartbeat alarm that Doze allows, so a still member stays online.
+ * - a heartbeat alarm that Doze allows, so a still member stays online;
+ * - the fused provider's own background fixes, delivered through a
+ *   PendingIntent: Android thins them to a few an hour for a background
+ *   app, and each one carries a real point.
  *
  * [WakeReceiver] turns each event into a drive start or a short run
  * ([WakeHub]). The wish is persisted, and the boot receiver re-arms it after
@@ -44,6 +49,7 @@ internal object WakeMonitor {
     const val ACTION_GEOFENCE = "com.lyokone.location.action.WAKE_GEOFENCE"
     const val ACTION_TRANSITION = "com.lyokone.location.action.WAKE_TRANSITION"
     const val ACTION_HEARTBEAT = "com.lyokone.location.action.WAKE_HEARTBEAT"
+    const val ACTION_FIX = "com.lyokone.location.action.WAKE_FIX"
 
     private const val PREFS_NAME = "flutter_location_prefs"
     private const val KEY_ARMED = "wake_armed"
@@ -77,6 +83,17 @@ internal object WakeMonitor {
     private const val RC_GEOFENCE = 0x4C01
     private const val RC_TRANSITION = 0x4C02
     private const val RC_HEARTBEAT = 0x4C03
+    private const val RC_FIX = 0x4C04
+
+    /**
+     * The at-rest request: balanced power every five minutes, batched up to
+     * ten. Android itself thins it to a few fixes an hour for a background
+     * app without a service, so the request costs no more than the system
+     * allows anyway.
+     */
+    private const val AT_REST_INTERVAL_MS = 300_000L
+    private const val AT_REST_MIN_INTERVAL_MS = 120_000L
+    private const val AT_REST_MAX_DELAY_MS = 600_000L
 
     private val transitions: List<ActivityTransition> by lazy {
         listOf(
@@ -145,6 +162,7 @@ internal object WakeMonitor {
         }
         armTransitions(app)
         scheduleHeartbeat(app)
+        armAtRestFixes(app)
         return true
     }
 
@@ -160,6 +178,7 @@ internal object WakeMonitor {
         armLeash(app)
         armTransitions(app)
         scheduleHeartbeat(app)
+        armAtRestFixes(app)
     }
 
     @JvmStatic
@@ -174,6 +193,7 @@ internal object WakeMonitor {
             Log.w(TAG, "The leash geofence could not be removed.", e)
         }
         removeTransitions(app)
+        removeAtRestFixes(app)
         (app.getSystemService(Context.ALARM_SERVICE) as? AlarmManager)?.cancel(pendingIntent(app, ACTION_HEARTBEAT, RC_HEARTBEAT, mutable = false))
     }
 
@@ -294,6 +314,37 @@ internal object WakeMonitor {
             ActivityRecognition.getClient(context).removeActivityTransitionUpdates(pendingIntent(context, ACTION_TRANSITION, RC_TRANSITION, mutable = true))
         } catch (e: Exception) {
             Log.w(TAG, "The activity transitions could not be removed.", e)
+        }
+    }
+
+    /**
+     * The fused provider's own background fixes, delivered to [WakeReceiver]
+     * through a PendingIntent, so they arrive while the app is dead. The same
+     * PendingIntent replaces an earlier request, so an armed call is
+     * idempotent. Each fix wakes Dart with a real point ([WakeReceiver]
+     * kind `fix`).
+     */
+    private fun armAtRestFixes(context: Context) {
+        val request =
+            LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, AT_REST_INTERVAL_MS)
+                .setMinUpdateIntervalMillis(AT_REST_MIN_INTERVAL_MS)
+                .setMaxUpdateDelayMillis(AT_REST_MAX_DELAY_MS)
+                .build()
+        try {
+            LocationServices.getFusedLocationProviderClient(context)
+                .requestLocationUpdates(request, pendingIntent(context, ACTION_FIX, RC_FIX, mutable = true))
+                .addOnFailureListener { Log.w(TAG, "The at-rest fixes were not requested.", it) }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No location permission for the at-rest fixes.", e)
+        }
+    }
+
+    private fun removeAtRestFixes(context: Context) {
+        try {
+            LocationServices.getFusedLocationProviderClient(context)
+                .removeLocationUpdates(pendingIntent(context, ACTION_FIX, RC_FIX, mutable = true))
+        } catch (e: Exception) {
+            Log.w(TAG, "The at-rest fixes could not be removed.", e)
         }
     }
 

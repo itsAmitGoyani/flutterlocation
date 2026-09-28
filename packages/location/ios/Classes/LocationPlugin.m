@@ -336,6 +336,12 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
 #else
     result([self isPermissionGranted] ? @1 : @0);
 #endif
+  } else if ([call.method isEqualToString:@"startMonitoringLocationPushes"]) {
+#if TARGET_OS_IOS
+    [self startMonitoringLocationPushes:result];
+#else
+    result(nil);
+#endif
   } else if ([call.method isEqualToString:@"registerHeadlessCallback"]) {
     // Android only: iOS relaunches the whole app for a location event.
     result(@0);
@@ -343,6 +349,49 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
     result(FlutterMethodNotImplemented);
   }
 }
+
+#if TARGET_OS_IOS
+// Apple's location pushes (iOS 15+): the token a server passes to APNs for
+// the topic `<bundle id>.location-query`. The app's Location Push Service
+// Extension runs for each push, even while the app is terminated. Answers
+// the token as hex, nil below iOS 15, or a FlutterError whose code is the
+// CLLocationPushServiceError code (1 no extension, 2 no push environment,
+// 3 no entitlement, 4 unsupported platform). Answered once, on the main
+// thread: the completion may come on any queue.
+- (void)startMonitoringLocationPushes:(FlutterResult)result {
+  if (@available(iOS 15.0, *)) {
+    __block BOOL answered = NO;
+    [self.clLocationManager startMonitoringLocationPushesWithCompletion:^(
+                                NSData *_Nullable token,
+                                NSError *_Nullable error) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (answered) {
+          return;
+        }
+        answered = YES;
+        if (error != nil || token == nil) {
+          long code = error != nil ? (long)error.code : -1L;
+          result([FlutterError
+              errorWithCode:[NSString stringWithFormat:@"%ld", code]
+                    message:error != nil ? error.localizedDescription
+                                         : @"No location push token."
+                    details:nil]);
+          return;
+        }
+        NSMutableString *hex =
+            [NSMutableString stringWithCapacity:token.length * 2];
+        const unsigned char *bytes = token.bytes;
+        for (NSUInteger i = 0; i < token.length; i++) {
+          [hex appendFormat:@"%02x", bytes[i]];
+        }
+        result(hex);
+      });
+    }];
+  } else {
+    result(nil);
+  }
+}
+#endif
 
 // The LocationAccuracy index Dart sends, as a Core Location accuracy:
 // powerSave, low, balanced, high, navigation, reduced.

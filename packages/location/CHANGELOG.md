@@ -1,6 +1,18 @@
-## Unreleased — AutoLNK fork (`itsAmitGoyani/flutterlocation`, branch `autolnk-4.00-background-location-sharing`, on the 8.0.1 line)
+## Unreleased — AutoLNK fork (`itsAmitGoyani/flutterlocation`, branch `autolnk-4.01-location-wake-pushes`, on the 8.0.1 line)
 
 ### ✨ Features
+
+- **iOS:** `locationPushToken` registers for Apple's location pushes
+  (`startMonitoringLocationPushes`, iOS 15+) and returns the device token as
+  hex, so a server can wake the app's Location Push Service Extension while
+  the app is terminated. A `PlatformException` carries the
+  `CLLocationPushServiceError` code; Android and older iOS answer null.
+- **Android:** at rest the wake sources also include the fused provider's
+  own background fixes, requested with balanced power every five minutes
+  and delivered through a PendingIntent to the wake receiver, so they arrive
+  while the app is dead. Android thins them to a few an hour for a background
+  app. Each one reaches the Dart handler as a wake of kind `fix` with its
+  point; at car speed it starts the drive like a leash exit.
 
 - **Android:** the foreground service is a started, sticky service once
   background mode is enabled. It persists the wish, the notification options
