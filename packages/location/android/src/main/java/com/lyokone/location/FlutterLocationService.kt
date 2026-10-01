@@ -852,6 +852,7 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         mainHandler.removeCallbacks(fixLimit)
         fixCancel?.cancel()
         fixCancel = null
+        Log.i(TAG, "Fix run ended with " + if (fix == null) "no fix." else if (fix.hasAccuracy()) "a fix of ${fix.accuracy.toInt()} m." else "a fix.")
         val app = applicationContext
         val wakes = fixRunWakes.toList()
         fixRunWakes.clear()

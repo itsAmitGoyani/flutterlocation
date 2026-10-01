@@ -5,6 +5,7 @@ import android.location.Location
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.work.Constraints
@@ -67,6 +68,10 @@ internal object WakeHub {
     /** The id of the wake the listener is on, or null. */
     private var inFlight: String? = null
 
+    /** Its kind and its start, for the log line that closes it. */
+    private var inFlightKind: String? = null
+    private var inFlightSince = 0L
+
     /** The jobs that wait for the queue to empty. */
     private val waiters = mutableListOf<() -> Unit>()
 
@@ -127,6 +132,9 @@ internal object WakeHub {
             while (queue.length() > MAX_QUEUE) queue.remove(0)
             writeQueue(app, queue)
         }
+        // One line per wake, readable in a release build. Never a position.
+        val accuracy = (wake["accuracy"] as? Number)?.toInt()
+        Log.i(TAG, "Wake ${wake["kind"]} queued" + if (accuracy != null) " with a fix of $accuracy m." else ".")
         try {
             val (name, request) = jobFor(wake["kind"])
             val operation = WorkManager.getInstance(app).enqueueUniqueWork(name, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
@@ -215,6 +223,8 @@ internal object WakeHub {
         }
         val id = next.optString("id")
         inFlight = id
+        inFlightKind = next.optString("kind")
+        inFlightSince = SystemClock.elapsedRealtime()
         val limit =
             Runnable {
                 if (inFlight == id) {
@@ -259,7 +269,9 @@ internal object WakeHub {
             writeQueue(context, kept)
         }
         if (inFlight == id) {
+            Log.i(TAG, "Wake $inFlightKind closed after ${SystemClock.elapsedRealtime() - inFlightSince} ms.")
             inFlight = null
+            inFlightKind = null
             answerLimit?.let { main.removeCallbacks(it) }
             answerLimit = null
         }

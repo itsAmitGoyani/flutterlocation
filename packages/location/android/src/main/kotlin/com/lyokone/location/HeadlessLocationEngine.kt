@@ -81,6 +81,7 @@ object HeadlessLocationEngine {
     ): Boolean {
         if (current != null) return true
         val engine = start(context, callbackHandle) ?: return false
+        Log.i(TAG, "Headless engine started.")
         current = engine
         plugin = engine.plugins.get(LocationPlugin::class.java) as? LocationPlugin
         dartStarted = false
