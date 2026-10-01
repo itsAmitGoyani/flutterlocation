@@ -18,26 +18,30 @@ import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.DetectedActivity
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingRequest
-import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
 
 /**
  * The system events that wake a sleeping app at rest (Android, AutoLNK fork).
  *
  * The foreground service runs only while the app needs continuous GPS in the
  * background: a drive. At rest the app holds no service and no location
- * request of its own, so Android shows no notification. Four sources wake it
- * instead. The system holds all four, so they outlive the process and a
+ * request of its own, so Android shows no notification. Three sources wake it
+ * instead. The system holds all three, so they outlive the process and a
  * swipe from Recents:
  *
  * - a "leash" geofence around the phone: an exit means the phone moved;
  * - activity transitions (vehicle, foot, bicycle, still), with the Motion
  *   permission;
- * - a heartbeat alarm that Doze allows, so a still member stays online;
- * - the fused provider's own background fixes, delivered through a
- *   PendingIntent: Android thins them to a few an hour for a background
- *   app, and each one carries a real point.
+ * - a heartbeat alarm that Doze allows, so a still member stays online.
+ *
+ * No standing fused request at rest (4.02). 4.01 kept one through a
+ * PendingIntent (balanced power, five minutes) for the provider's own
+ * background fixes. It cost no GPS, but a registration is "location in use"
+ * to the system: MIUI showed the location dot for as long as it was armed
+ * (proved on a Mi 11i, Android 13, with the app ops dump: MONITOR_LOCATION
+ * running while no fix was delivered). The leash exit and the heartbeat's
+ * fresh fix already cover a fix at rest. [removeAtRestFixes] drops the
+ * request an updated install still holds.
  *
  * [WakeReceiver] turns each event into a drive start or a short run
  * ([WakeHub]). The wish is persisted, and the boot receiver re-arms it after
@@ -84,16 +88,6 @@ internal object WakeMonitor {
     private const val RC_TRANSITION = 0x4C02
     private const val RC_HEARTBEAT = 0x4C03
     private const val RC_FIX = 0x4C04
-
-    /**
-     * The at-rest request: balanced power every five minutes, batched up to
-     * ten. Android itself thins it to a few fixes an hour for a background
-     * app without a service, so the request costs no more than the system
-     * allows anyway.
-     */
-    private const val AT_REST_INTERVAL_MS = 300_000L
-    private const val AT_REST_MIN_INTERVAL_MS = 120_000L
-    private const val AT_REST_MAX_DELAY_MS = 600_000L
 
     private val transitions: List<ActivityTransition> by lazy {
         listOf(
@@ -162,7 +156,8 @@ internal object WakeMonitor {
         }
         armTransitions(app)
         scheduleHeartbeat(app)
-        armAtRestFixes(app)
+        // An install updated from 4.01 may still hold its at-rest request.
+        removeAtRestFixes(app)
         return true
     }
 
@@ -178,7 +173,7 @@ internal object WakeMonitor {
         armLeash(app)
         armTransitions(app)
         scheduleHeartbeat(app)
-        armAtRestFixes(app)
+        removeAtRestFixes(app)
     }
 
     @JvmStatic
@@ -318,27 +313,10 @@ internal object WakeMonitor {
     }
 
     /**
-     * The fused provider's own background fixes, delivered to [WakeReceiver]
-     * through a PendingIntent, so they arrive while the app is dead. The same
-     * PendingIntent replaces an earlier request, so an armed call is
-     * idempotent. Each fix wakes Dart with a real point ([WakeReceiver]
-     * kind `fix`).
+     * Drops the 4.01 at-rest fused request ([ACTION_FIX]) when Play services
+     * still holds it: after an update, and whenever the sources are armed or
+     * disarmed. Idempotent; a removal of nothing is not an error.
      */
-    private fun armAtRestFixes(context: Context) {
-        val request =
-            LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, AT_REST_INTERVAL_MS)
-                .setMinUpdateIntervalMillis(AT_REST_MIN_INTERVAL_MS)
-                .setMaxUpdateDelayMillis(AT_REST_MAX_DELAY_MS)
-                .build()
-        try {
-            LocationServices.getFusedLocationProviderClient(context)
-                .requestLocationUpdates(request, pendingIntent(context, ACTION_FIX, RC_FIX, mutable = true))
-                .addOnFailureListener { Log.w(TAG, "The at-rest fixes were not requested.", it) }
-        } catch (e: SecurityException) {
-            Log.w(TAG, "No location permission for the at-rest fixes.", e)
-        }
-    }
-
     private fun removeAtRestFixes(context: Context) {
         try {
             LocationServices.getFusedLocationProviderClient(context)

@@ -142,6 +142,8 @@ class WakeReceiver : BroadcastReceiver() {
     /**
      * One of the fused provider's own background fixes at rest: a real point
      * without a service. At car speed it starts the drive, like a leash exit.
+     * Since 4.02 nothing arms that request; the branch stays for the request
+     * an install updated from 4.01 holds until [WakeMonitor] removes it.
      */
     private fun onFix(
         app: Context,
