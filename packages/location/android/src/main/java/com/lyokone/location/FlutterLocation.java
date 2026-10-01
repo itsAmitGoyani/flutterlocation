@@ -283,7 +283,17 @@ public class FlutterLocation
         createLocationCallback();
         createLocationRequest();
         buildLocationSettingsRequest();
-        startRequestingLocation();
+        // The new settings reach the provider only while somebody waits for a fix. Upstream
+        // started the request here even with no listener: it then stayed registered until its
+        // first fix, and a registration counts as location in use (AutoLNK fork, 4.02).
+        if (hasConsumer()) {
+            startRequestingLocation();
+        }
+    }
+
+    /** A stream listener or a pending one-shot waits for a fix. */
+    private boolean hasConsumer() {
+        return events != null || getLocationResult != null;
     }
 
     private void sendError(String errorCode, String errorMessage, Object errorDetails) {
@@ -549,8 +559,7 @@ public class FlutterLocation
         }
         mSettingsClient.checkLocationSettings(mLocationSettingsRequest)
                 .addOnSuccessListener(locationSettingsResponse -> {
-                    attachNmeaListener();
-                    requestLocationUpdates();
+                    startUpdatesForConsumer();
                 }).addOnFailureListener(e -> {
                     if (e instanceof ResolvableApiException) {
                         ResolvableApiException rae = (ResolvableApiException) e;
@@ -560,8 +569,7 @@ public class FlutterLocation
                             if (activity == null) {
                                 // Nothing can show the dialog. Ask anyway: whatever the
                                 // settings allow is delivered.
-                                attachNmeaListener();
-                                requestLocationUpdates();
+                                startUpdatesForConsumer();
                                 return;
                             }
                             try {
@@ -576,14 +584,26 @@ public class FlutterLocation
                         ApiException ae = (ApiException) e;
                         int statusCode = ae.getStatusCode();
                         if (statusCode == LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE) {// This error code happens during AirPlane mode.
-                            attachNmeaListener();
-                            requestLocationUpdates();
+                            startUpdatesForConsumer();
                         } else {// This should not happen according to Android documentation but it has been
                             // observed on some phones.
                             sendError("UNEXPECTED_ERROR", e.getMessage(), null);
                         }
                     }
                 });
+    }
+
+    /**
+     * Registers the request, but only while somebody still waits for a fix. The settings check
+     * in {@link #startRequestingLocation()} answers asynchronously: a stream that was cancelled
+     * meanwhile must not get a request that nothing would ever remove (AutoLNK fork, 4.02).
+     */
+    private void startUpdatesForConsumer() {
+        if (!hasConsumer()) {
+            return;
+        }
+        attachNmeaListener();
+        requestLocationUpdates();
     }
 
     /** The main looper on purpose: a headless engine's calls have no other looper to promise. */
