@@ -84,6 +84,12 @@ internal object WakeMonitor {
     private const val MIN_HEARTBEAT_MS = 60_000L
     private const val DEFAULT_DRIVE_SPEED_MPS = 6.7f
 
+    /**
+     * Without a speed error only a GPS-grade fix stands behind its speed. The
+     * Dart side reads the same limit (`activityDerivedSpeedMaxAccuracyMeters`).
+     */
+    private const val DERIVED_SPEED_MAX_ACCURACY_M = 25f
+
     private const val RC_GEOFENCE = 0x4C01
     private const val RC_TRANSITION = 0x4C02
     private const val RC_HEARTBEAT = 0x4C03
@@ -108,6 +114,34 @@ internal object WakeMonitor {
     fun isArmed(context: Context): Boolean = prefs(context).getBoolean(KEY_ARMED, false)
 
     fun driveSpeedMps(context: Context): Float = prefs(context).getFloat(KEY_DRIVE_SPEED, DEFAULT_DRIVE_SPEED_MPS)
+
+    /**
+     * The speed a fix can prove: its reading less its own error, floored at
+     * zero. The Dart side applies the same rule to every speed
+     * (`evidenceSpeed`). One raw reading is no evidence: a first fix after
+     * the receiver starts can report car speed for a phone that stands
+     * still, and that started the drive service for a person on foot
+     * (Mi 11i, 2026-10-01). A negative error voids the reading. With no
+     * error figure only a GPS-grade fix counts.
+     */
+    @JvmStatic
+    fun provenSpeedMps(location: Location): Float {
+        if (!location.hasSpeed()) return 0f
+        val speed = location.speed
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasSpeedAccuracy()) {
+            val error = location.speedAccuracyMetersPerSecond
+            if (error < 0f) return 0f
+            if (error > 0f) return (speed - error).coerceAtLeast(0f)
+        }
+        return if (location.hasAccuracy() && location.accuracy <= DERIVED_SPEED_MAX_ACCURACY_M) speed else 0f
+    }
+
+    /** Whether [location] proves car speed: the gate of every native drive start. */
+    @JvmStatic
+    fun provesDriveSpeed(
+        context: Context,
+        location: Location,
+    ): Boolean = provenSpeedMps(location) >= driveSpeedMps(context)
 
     /**
      * Whether Play services holds the leash now. False after a failed add,

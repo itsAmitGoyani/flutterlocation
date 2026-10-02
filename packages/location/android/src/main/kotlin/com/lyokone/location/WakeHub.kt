@@ -153,6 +153,8 @@ internal object WakeHub {
             put("longitude", location.longitude)
             if (location.hasAccuracy()) put("accuracy", location.accuracy.toDouble())
             if (location.hasSpeed()) put("speed", location.speed.toDouble())
+            // Dart reads a speed by what its error leaves of it.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasSpeedAccuracy()) put("speedAccuracy", location.speedAccuracyMetersPerSecond.toDouble())
             if (location.hasBearing()) put("heading", location.bearing.toDouble())
             put("time", location.time.toDouble())
         }

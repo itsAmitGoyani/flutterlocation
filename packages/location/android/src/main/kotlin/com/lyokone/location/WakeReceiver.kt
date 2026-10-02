@@ -99,7 +99,7 @@ class WakeReceiver : BroadcastReceiver() {
             return finish()
         }
         val point = location?.let { WakeHub.pointOf(it) } ?: emptyMap()
-        val driveFix = location?.takeIf { it.hasSpeed() && it.speed >= WakeMonitor.driveSpeedMps(app) }
+        val driveFix = location?.takeIf { WakeMonitor.provesDriveSpeed(app, it) }
         if (driveFix != null && FlutterLocationService.startForDrive(app)) {
             WakeMonitor.setLeash(app, driveFix.latitude, driveFix.longitude)
             WakeHub.enqueue(app, point + ("kind" to "drive") + ("ts" to now()), finish)
@@ -156,7 +156,7 @@ class WakeReceiver : BroadcastReceiver() {
         // The leash follows the phone under its own rules (accuracy, spacing).
         WakeMonitor.onFix(app, location)
         val point = WakeHub.pointOf(location)
-        if (location.hasSpeed() && location.speed >= WakeMonitor.driveSpeedMps(app) && FlutterLocationService.startForDrive(app)) {
+        if (WakeMonitor.provesDriveSpeed(app, location) && FlutterLocationService.startForDrive(app)) {
             WakeHub.enqueue(app, point + ("kind" to "drive") + ("ts" to now()), finish)
             return
         }
