@@ -56,12 +56,14 @@ void main() {
       enable: true,
       heartbeatMs: 300000,
       driveSpeedMps: 6.7,
+      fixAccuracyMeters: 50,
       latitude: 23.03,
       longitude: 72.58,
     );
     final Map<Object?, Object?> args = calls.single.arguments as Map;
     expect(args['heartbeatMs'], 300000);
     expect(args['driveSpeedMps'], 6.7);
+    expect(args['fixAccuracyMeters'], 50);
     expect(args['latitude'], 23.03);
     expect(args['longitude'], 72.58);
   });

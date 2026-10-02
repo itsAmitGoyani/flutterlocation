@@ -13,6 +13,13 @@
             android:exported="false"
             android:foregroundServiceType="location"
             android:name=".FlutterLocationService"/>
+        <!-- One fix for a wake, in a short foreground run of its own, so
+             Android judges its notification by itself every time (4.02). -->
+        <service
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="location"
+            android:name=".FlutterLocationFixService"/>
         <!-- The wake sources at rest: the leash geofence, the activity
              transitions and the heartbeat alarm (WakeMonitor). -->
         <receiver

@@ -199,6 +199,7 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         final Boolean enable = call.argument("enable");
         final Number heartbeatMs = call.argument("heartbeatMs");
         final Number driveSpeedMps = call.argument("driveSpeedMps");
+        final Number fixAccuracyMeters = call.argument("fixAccuracyMeters");
         final Number latitude = call.argument("latitude");
         final Number longitude = call.argument("longitude");
         final Boolean restoreServiceAtBoot = call.argument("restoreServiceAtBoot");
@@ -209,6 +210,7 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
                 Boolean.TRUE.equals(enable),
                 heartbeatMs == null ? null : heartbeatMs.longValue(),
                 driveSpeedMps == null ? null : driveSpeedMps.floatValue(),
+                fixAccuracyMeters == null ? null : fixAccuracyMeters.floatValue(),
                 latitude == null ? null : latitude.doubleValue(),
                 longitude == null ? null : longitude.doubleValue(),
                 restoreServiceAtBoot,
@@ -268,6 +270,9 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
                     .getCurrentLocation(request, new CancellationTokenSource().getToken())
                     .addOnCompleteListener(task -> {
                         final Location fix = task.isSuccessful() ? task.getResult() : null;
+                        // The leash follows this fix too: at rest it is the
+                        // only one that places a phone that walked away.
+                        if (fix != null) WakeMonitor.onFix(context, fix);
                         result.success(fix == null ? null : WakeHub.pointOf(fix));
                     });
         } catch (SecurityException e) {

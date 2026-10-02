@@ -190,14 +190,18 @@ class Location implements LocationPlatform {
   ///
   /// Android: a leash geofence, the activity transitions (with the Motion
   /// permission) and a heartbeat alarm every [heartbeatMs] that Doze allows.
-  /// A vehicle transition, or a leash exit faster than [driveSpeedMps],
-  /// starts the foreground service for a drive. A leash exit, a stop and a
-  /// parked car take one fix in a short foreground run first, which ends
+  /// A vehicle transition, or a leash exit whose fix proves a speed of
+  /// [driveSpeedMps] (the reading less its own error), starts the foreground
+  /// service for a drive. A leash exit, a stop and a parked car take one fix
+  /// in a short foreground run first. The run listens until a fix is as
+  /// sharp as [fixAccuracyMeters] or about seven seconds passed, and ends
   /// before Android shows its notification ([fixTitle], [fixBody] are its
-  /// copy where a phone shows it at once). Every event reaches the handler
-  /// of [setWakeHandler]. The boot receiver re-arms them after a reboot or
-  /// an app update; [restoreServiceAtBoot] false (the drive-only mode) makes
-  /// it take one fix instead of restoring the service.
+  /// copy). Android hides that notification once in about two minutes of
+  /// awake time, and never before Android 12: a wake in between gets no run
+  /// and comes without the fix. Every event reaches the handler of
+  /// [setWakeHandler]. The boot receiver re-arms them after a reboot or an
+  /// app update; [restoreServiceAtBoot] false (the drive-only mode) makes it
+  /// take one fix instead of restoring the service.
   ///
   /// [latitude] and [longitude] put the leash on the spot where the app goes
   /// to sleep. Returns false without the background location grant. iOS
@@ -207,6 +211,7 @@ class Location implements LocationPlatform {
     required bool enable,
     int? heartbeatMs,
     double? driveSpeedMps,
+    double? fixAccuracyMeters,
     double? latitude,
     double? longitude,
     bool? restoreServiceAtBoot,
@@ -219,6 +224,7 @@ class Location implements LocationPlatform {
         'enable': enable,
         if (heartbeatMs != null) 'heartbeatMs': heartbeatMs,
         if (driveSpeedMps != null) 'driveSpeedMps': driveSpeedMps,
+        if (fixAccuracyMeters != null) 'fixAccuracyMeters': fixAccuracyMeters,
         if (latitude != null && longitude != null) 'latitude': latitude,
         if (latitude != null && longitude != null) 'longitude': longitude,
         if (restoreServiceAtBoot != null)
@@ -236,7 +242,8 @@ class Location implements LocationPlatform {
   /// Android only. Makes this engine's Dart side the one that takes the
   /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat`,
   /// `refresh`, `boot` or `fix`. A wake can carry a point (`latitude`,
-  /// `longitude`, `accuracy`, `speed`, `heading`, `time`): the exit point of
+  /// `longitude`, `accuracy`, `speed`, `speedAccuracy`, `heading`, `time`):
+  /// the exit point of
   /// a leash, one of the fused provider's own background fixes at rest
   /// (`fix`), or the fix of a short foreground run (`fixRun` true). A heartbeat carries
   /// `leashOk`, false while Play services holds no leash. The wake counts as

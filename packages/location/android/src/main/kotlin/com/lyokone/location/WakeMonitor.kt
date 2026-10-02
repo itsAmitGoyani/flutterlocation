@@ -59,6 +59,7 @@ internal object WakeMonitor {
     private const val KEY_ARMED = "wake_armed"
     private const val KEY_HEARTBEAT_MS = "wake_heartbeat_ms"
     private const val KEY_DRIVE_SPEED = "wake_drive_speed_mps"
+    private const val KEY_FIX_ACCURACY = "wake_fix_accuracy_m"
     private const val KEY_LEASH_LAT = "wake_leash_lat"
     private const val KEY_LEASH_LNG = "wake_leash_lng"
     private const val KEY_LEASH_OK = "wake_leash_ok"
@@ -83,6 +84,7 @@ internal object WakeMonitor {
     private const val DEFAULT_HEARTBEAT_MS = 300_000L
     private const val MIN_HEARTBEAT_MS = 60_000L
     private const val DEFAULT_DRIVE_SPEED_MPS = 6.7f
+    private const val DEFAULT_FIX_ACCURACY_M = 50f
 
     /**
      * Without a speed error only a GPS-grade fix stands behind its speed. The
@@ -114,6 +116,9 @@ internal object WakeMonitor {
     fun isArmed(context: Context): Boolean = prefs(context).getBoolean(KEY_ARMED, false)
 
     fun driveSpeedMps(context: Context): Float = prefs(context).getFloat(KEY_DRIVE_SPEED, DEFAULT_DRIVE_SPEED_MPS)
+
+    /** The accuracy at which a fix run stops listening: a fix the app accepts as a place. */
+    fun fixAccuracyM(context: Context): Float = prefs(context).getFloat(KEY_FIX_ACCURACY, DEFAULT_FIX_ACCURACY_M)
 
     /**
      * The speed a fix can prove: its reading less its own error, floored at
@@ -167,6 +172,7 @@ internal object WakeMonitor {
         enable: Boolean,
         heartbeatMs: Long?,
         driveSpeedMps: Float?,
+        fixAccuracyMeters: Float?,
         latitude: Double?,
         longitude: Double?,
         restoreServiceAtBoot: Boolean?,
@@ -182,6 +188,7 @@ internal object WakeMonitor {
         val editor = prefs(app).edit().putBoolean(KEY_ARMED, true)
         if (heartbeatMs != null) editor.putLong(KEY_HEARTBEAT_MS, heartbeatMs.coerceAtLeast(MIN_HEARTBEAT_MS))
         if (driveSpeedMps != null && driveSpeedMps > 0f) editor.putFloat(KEY_DRIVE_SPEED, driveSpeedMps)
+        if (fixAccuracyMeters != null && fixAccuracyMeters > 0f) editor.putFloat(KEY_FIX_ACCURACY, fixAccuracyMeters)
         editor.apply()
         if (latitude != null && longitude != null) {
             setLeash(app, latitude, longitude)
