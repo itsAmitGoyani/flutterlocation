@@ -434,9 +434,13 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
     private void onChangeNotificationOptions(MethodCall call, Result result) {
         try {
             String passedChannelName = call.argument("channelName");
+            // A call that names no channel keeps the name in force: it is the
+            // label of the category in the system settings, and the copy of
+            // one caller must not rename it for the others.
+            final NotificationOptions saved = FlutterLocationService.savedNotificationOptions(context);
             String channelName = passedChannelName != null
                     ? passedChannelName
-                    : FlutterLocationServiceKt.kDefaultChannelName;
+                    : saved != null ? saved.getChannelName() : FlutterLocationServiceKt.kDefaultChannelName;
 
             String passedTitle = call.argument("title");
             String title = passedTitle != null

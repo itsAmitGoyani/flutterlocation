@@ -123,8 +123,10 @@ class Location implements LocationPlatform {
   /// When [onTapBringToFront] is set to true, tapping the notification will
   /// bring the activity back to the front.
   ///
-  /// Both [title] and [channelName] will be set to defaults, if no values are
-  /// provided. All other null arguments will be ignored.
+  /// [title] will be set to its default, if no value is provided. A call
+  /// without [channelName] keeps the name in force (AutoLNK fork), and takes
+  /// the default only before any name was set. All other null arguments
+  /// will be ignored.
   ///
   /// Returns [AndroidNotificationData] if the notification is currently being
   /// shown. This can be used to change the notification from other parts of the
