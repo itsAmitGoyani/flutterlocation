@@ -2,8 +2,16 @@
 
 #ifdef COCOAPODS
 @import CoreLocation;
+#if TARGET_OS_IOS
+@import BackgroundTasks;
+@import UserNotifications;
+#endif
 #else
 #import <CoreLocation/CoreLocation.h>
+#if TARGET_OS_IOS
+#import <BackgroundTasks/BackgroundTasks.h>
+#import <UserNotifications/UserNotifications.h>
+#endif
 #endif
 
 @interface LocationPlugin () <FlutterStreamHandler, CLLocationManagerDelegate>
@@ -53,6 +61,23 @@
 @property(assign, nonatomic) BOOL oneShotAccuracyRaised;
 @property(assign, nonatomic) CLLocationAccuracy savedAccuracy;
 @property(assign, nonatomic) NSUInteger oneShotGeneration;
+
+// AutoLNK fork (4.10): the location alert and the background refresh.
+// The refresh task iOS handed this process, until it completes (a BGTask;
+// typed id, so the iOS 11 target of this pod needs no availability guard).
+@property(strong, nonatomic) id refreshTask;
+// iOS launched this process for the refresh task: Dart takes the
+// background path, as for a location launch.
+@property(assign, nonatomic) BOOL launchedForRefresh;
+// Background time held after an authorization change, so the status report
+// that Dart sends can leave before iOS suspends the app.
+@property(assign, nonatomic) UIBackgroundTaskIdentifier reportHold;
+// Dart takes refresh runs in this process (setBackgroundRefreshHandler).
+@property(assign, nonatomic) BOOL refreshListening;
+// A refresh request was wanted when this process launched: a launch into
+// the background with no scene may be that run, before iOS hands the task
+// over.
+@property(assign, nonatomic) BOOL refreshWantedAtLaunch;
 @end
 
 static NSString *const kRelaunchArmedKey = @"lyokone_location_relaunch_armed";
@@ -71,6 +96,27 @@ static const NSTimeInterval kLeashRecenterMinIntervalSeconds = 30.0;
 static const NSTimeInterval kDartWatchdogSeconds = 90.0;
 // The longest a one-shot read keeps the best accuracy without a fix.
 static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
+
+// AutoLNK fork (4.10), after Life360 on iOS: one notification while the
+// location switch is off or the grant is "Never", for a user whom Dart
+// marked as wanting the share. Life360 words both cases as "location
+// services are off", and so does this alert.
+static NSString *const kAlertIdentifier = @"lyokone.location.alert";
+static NSString *const kAlertPostedKey = @"lyokone_location_alert_posted";
+static NSString *const kAlertShareWantedKey =
+    @"lyokone_location_alert_share_wanted";
+static NSString *const kAlertCopyKey = @"lyokone_location_alert_copy";
+// The background refresh task: `<bundle id>.location-refresh`, which the
+// app lists in BGTaskSchedulerPermittedIdentifiers. Life360 asks for its
+// own `reportpermissions` task 599 s ahead after each run.
+static NSString *const kRefreshSuffix = @".location-refresh";
+static NSString *const kRefreshWantedKey = @"lyokone_location_refresh_wanted";
+static const NSTimeInterval kRefreshIntervalSeconds = 600.0;
+// The time a backgrounded app keeps after an authorization change: iOS
+// allows about 30 s of background time.
+static const NSTimeInterval kReportHoldSeconds = 25.0;
+// iOS lets a process register a task identifier once.
+static BOOL refreshRegistered = NO;
 
 @implementation LocationPlugin
 
@@ -95,6 +141,22 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
          selector:@selector(protectedDataDidBecomeAvailable:)
              name:UIApplicationProtectedDataDidBecomeAvailable
            object:nil];
+  // Each return to the app checks the location alert (4.10): a cause that
+  // went while the app slept clears the stale posted flag here, and one
+  // that holds posts, as Life360 notifies at each app open. Both names,
+  // because a UIScene app may skip the application one.
+  [[NSNotificationCenter defaultCenter]
+      addObserver:instance
+         selector:@selector(appBecameActive:)
+             name:UIApplicationDidBecomeActiveNotification
+           object:nil];
+  if (@available(iOS 13.0, *)) {
+    [[NSNotificationCenter defaultCenter]
+        addObserver:instance
+           selector:@selector(appBecameActive:)
+               name:UISceneDidActivateNotification
+             object:nil];
+  }
 #endif
 }
 
@@ -107,6 +169,9 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
     self.flutterListening = NO;
     self.waitNextLocation = 2;
     self.hasInit = NO;
+#if TARGET_OS_IOS
+    self.reportHold = UIBackgroundTaskInvalid;
+#endif
   }
   return self;
 }
@@ -310,17 +375,66 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
   } else if ([call.method isEqualToString:@"listenForWakes"] ||
              [call.method isEqualToString:@"stopListeningForWakes"] ||
              [call.method isEqualToString:@"requestWake"] ||
-             [call.method isEqualToString:@"finishHeadlessRun"] ||
-             [call.method isEqualToString:@"setLocationAlertCopy"] ||
-             [call.method isEqualToString:@"syncLocationAlerts"]) {
+             [call.method isEqualToString:@"finishHeadlessRun"]) {
     // Android only: iOS relaunches the whole app and streams from Dart.
     result(@0);
+  } else if ([call.method isEqualToString:@"setLocationAlertCopy"]) {
+#if TARGET_OS_IOS
+    [self storeAlertCopy:call.arguments];
+    result(@1);
+#else
+    result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"syncLocationAlerts"]) {
+#if TARGET_OS_IOS
+    id wanted = call.arguments[@"shareWanted"];
+    [[NSUserDefaults standardUserDefaults]
+        setBool:[wanted isKindOfClass:[NSNumber class]] && [wanted boolValue]
+         forKey:kAlertShareWantedKey];
+    [self syncLocationAlert];
+    result(@1);
+#else
+    result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"scheduleBackgroundRefresh"]) {
+#if TARGET_OS_IOS
+    [self ensureRefreshScheduled:result];
+#else
+    result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"cancelBackgroundRefresh"]) {
+#if TARGET_OS_IOS
+    [self cancelRefresh];
+    result(@1);
+#else
+    result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"completeBackgroundRefresh"]) {
+#if TARGET_OS_IOS
+    result([self completeRefreshTask:YES] ? @1 : @0);
+#else
+    result(@0);
+#endif
+  } else if ([call.method isEqualToString:@"listenForBackgroundRefresh"]) {
+#if TARGET_OS_IOS
+    id listen = call.arguments[@"listen"];
+    self.refreshListening =
+        [listen isKindOfClass:[NSNumber class]] && [listen boolValue];
+    // A task that came before Dart listened runs now.
+    if (self.refreshListening && self.refreshTask != nil) {
+      [self deliverRefreshToDart];
+    }
+    result(@1);
+#else
+    result(@0);
+#endif
   } else if ([call.method isEqualToString:@"getCurrentFix"]) {
     // Android only: the wakes that need it run on Android.
     result(nil);
   } else if ([call.method isEqualToString:@"wasLaunchedByLocationEvent"]) {
 #if TARGET_OS_IOS
-    result(self.launchedForLocation || [self isBackgroundLaunchWhileArmed]
+    result(self.launchedForLocation || self.launchedForRefresh ||
+                   [self isBackgroundLaunchWhileArmed]
                ? @1
                : @0);
 #else
@@ -608,18 +722,30 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
 - (void)locationManager:(CLLocationManager *)manager
     didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
 #if TARGET_OS_IOS
+  // AutoLNK (4.10): the alert follows the switch and the grant at once,
+  // with no Dart, and a backgrounded app keeps time for Dart's report.
+  [self syncLocationAlert];
+  [self holdBackgroundTimeForReport];
+  // Dart reads the grant again: in the background nothing else tells it
+  // (the app's motion stream is closed there), so a grant that came back
+  // while the app slept would wait for the next open.
+  [self.channel invokeMethod:@"onAuthorizationChanged"
+                   arguments:@{@"status" : @(status)}];
   if (status == kCLAuthorizationStatusAuthorizedAlways) {
     // An armed launch that read "not determined" arms once Always is known.
     if (self.armOnAlways) {
       [self armRelaunchMonitoring];
     }
-  } else if (status != kCLAuthorizationStatusNotDetermined &&
-             (self.relaunchArmed || self.armOnAlways) &&
-             [CLLocationManager locationServicesEnabled]) {
-    // The grant no longer allows a background relaunch: keep no monitor.
-    // With Location Services off every app reads Denied, and the monitors
-    // stay for when they come back.
-    [self disarmRelaunchMonitoring];
+  }
+  // A grant below Always keeps the monitors (4.10, after Life360). Only
+  // Dart disarms them, when the share is known to be gone (a sign-out, no
+  // server). iOS drops an app's significant-change and visit requests when
+  // the grant goes; Life360 starts its significant-change monitoring again
+  // while it runs under the lower grant, and iOS then delivers a first fix
+  // the moment Always comes back, which wakes it. The same restart here.
+  if (status != kCLAuthorizationStatusAuthorizedAlways &&
+      status != kCLAuthorizationStatusNotDetermined && self.relaunchArmed) {
+    [self restartChangeMonitorsForReturn];
   }
 #endif
   if (status == kCLAuthorizationStatusDenied) {
@@ -685,7 +811,10 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
 // UIScene app gets no launch options, and the location event may reach the
 // delegate only after Dart asks. A user launch has a scene by then.
 - (BOOL)isBackgroundLaunchWhileArmed {
-  if (!self.armedAtLaunch) {
+  // Or with a refresh request pending (4.10): a member whose grant is gone
+  // has no monitors armed, and the refresh run must still take the
+  // background path.
+  if (!self.armedAtLaunch && !self.refreshWantedAtLaunch) {
     return NO;
   }
   UIApplication *application = UIApplication.sharedApplication;
@@ -747,6 +876,19 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
     // A phone already outside the kept leash gets no exit; the state says.
     [manager requestStateForRegion:self.leash];
   }
+}
+
+// Significant change and visits again, under a grant that delivers nothing
+// now, so iOS holds them for the return of Always (see the authorization
+// callback). The leash stays as it is: iOS keeps or drops regions itself.
+- (void)restartChangeMonitorsForReturn {
+  CLLocationManager *manager = self.clLocationManager;
+  if ([CLLocationManager significantLocationChangeMonitoringAvailable]) {
+    [manager stopMonitoringSignificantLocationChanges];
+    [manager startMonitoringSignificantLocationChanges];
+  }
+  [manager stopMonitoringVisits];
+  [manager startMonitoringVisits];
 }
 
 - (void)disarmRelaunchMonitoring {
@@ -956,6 +1098,8 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
 // the event itself arrives.
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  // iOS accepts a task handler only before the launch finishes.
+  [self registerRefreshTask];
   BOOL byLocation =
       launchOptions[UIApplicationLaunchOptionsLocationKey] != nil;
   BOOL protectedData = application.isProtectedDataAvailable;
@@ -963,6 +1107,9 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
   // system kept tells whether the monitors were armed.
   BOOL armed = protectedData && [[NSUserDefaults standardUserDefaults]
                                     boolForKey:kRelaunchArmedKey];
+  self.refreshWantedAtLaunch =
+      protectedData &&
+      [[NSUserDefaults standardUserDefaults] boolForKey:kRefreshWantedKey];
   if (!armed && !byLocation && protectedData) {
     return YES;
   }
@@ -984,9 +1131,9 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
   } else if (status == kCLAuthorizationStatusNotDetermined) {
     // An early read can say this; the authorization callback decides.
     self.armOnAlways = YES;
-  } else if ([CLLocationManager locationServicesEnabled]) {
-    [self disarmRelaunchMonitoring];
   }
+  // A grant below Always keeps the monitors armed (4.10): see the
+  // authorization callback.
   return YES;
 }
 
@@ -1026,6 +1173,311 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
                      withError:(NSError *)error {
   NSLog(@"[Location] region monitoring failed for %@: %@", region.identifier,
         error);
+}
+
+#pragma mark - AutoLNK fork: the location alert (4.10)
+
+- (void)appBecameActive:(NSNotification *)notification {
+  [self syncLocationAlert];
+}
+
+// The app's words, kept for a launch that has no Dart yet. Strings only.
+- (void)storeAlertCopy:(id)arguments {
+  if (![arguments isKindOfClass:[NSDictionary class]]) {
+    return;
+  }
+  NSMutableDictionary<NSString *, NSString *> *copy =
+      [NSMutableDictionary dictionary];
+  [(NSDictionary *)arguments
+      enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if ([key isKindOfClass:[NSString class]] &&
+            [value isKindOfClass:[NSString class]]) {
+          copy[key] = value;
+        }
+      }];
+  [[NSUserDefaults standardUserDefaults] setObject:copy forKey:kAlertCopyKey];
+}
+
+- (NSString *)alertText:(NSString *)key fallback:(NSString *)fallback {
+  NSDictionary *copy =
+      [[NSUserDefaults standardUserDefaults] dictionaryForKey:kAlertCopyKey];
+  id value = copy[key];
+  return [value isKindOfClass:[NSString class]] && [value length] > 0
+             ? value
+             : fallback;
+}
+
+// The switch is off, or this app's grant is "Never". With the switch off
+// iOS reports "denied" for every app, so the switch is read first.
+- (BOOL)locationUnusable {
+  if (![CLLocationManager locationServicesEnabled]) {
+    return YES;
+  }
+  return [self authorizationStatus] == kCLAuthorizationStatusDenied;
+}
+
+// Posts the alert while its cause holds for a user whom Dart marked as one
+// who wants the share, and removes it when the cause goes. Posted once per
+// cause: the flag stays until the cause goes, so many syncs make one
+// notification, and an alert the user dismissed comes back only with a new
+// cause. Idempotent: every authorization change and every sync calls it.
+- (void)syncLocationAlert {
+  [self initLocation];
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  BOOL cause = [defaults boolForKey:kAlertShareWantedKey] &&
+               [self locationUnusable];
+  BOOL posted = [defaults boolForKey:kAlertPostedKey];
+  UNUserNotificationCenter *center =
+      [UNUserNotificationCenter currentNotificationCenter];
+  if (cause && !posted) {
+    [defaults setBool:YES forKey:kAlertPostedKey];
+    UNMutableNotificationContent *content =
+        [[UNMutableNotificationContent alloc] init];
+    content.title = [self alertText:@"servicesOffTitle"
+                           fallback:@"Location services are off"];
+    content.body =
+        [self alertText:@"servicesOffBody"
+               fallback:@"You turned off location services, which stopped your "
+                        @"location sharing. Turn location services on to "
+                        @"reconnect."];
+    content.sound = [UNNotificationSound defaultSound];
+    if (@available(iOS 15.0, *)) {
+      // Life360's alert is time sensitive. Without the entitlement iOS
+      // delivers it as an ordinary alert.
+      content.interruptionLevel = UNNotificationInterruptionLevelTimeSensitive;
+    }
+    UNNotificationRequest *request =
+        [UNNotificationRequest requestWithIdentifier:kAlertIdentifier
+                                             content:content
+                                             trigger:nil];
+    [center addNotificationRequest:request
+             withCompletionHandler:^(NSError *_Nullable error) {
+               if (error == nil) {
+                 return;
+               }
+               // Notifications are off, for example: the next sync tries
+               // again.
+               NSLog(@"[Location] location alert not posted: %@", error);
+               dispatch_async(dispatch_get_main_queue(), ^{
+                 [[NSUserDefaults standardUserDefaults]
+                     removeObjectForKey:kAlertPostedKey];
+               });
+             }];
+  } else if (!cause && posted) {
+    [defaults removeObjectForKey:kAlertPostedKey];
+    [center removeDeliveredNotificationsWithIdentifiers:@[ kAlertIdentifier ]];
+    [center
+        removePendingNotificationRequestsWithIdentifiers:@[ kAlertIdentifier ]];
+  }
+}
+
+#pragma mark - AutoLNK fork: background time for the report (4.10)
+
+// A backgrounded app that hears of a lost switch or grant loses its
+// location updates too, and iOS would suspend it before Dart's status
+// report leaves. Each change holds kReportHoldSeconds afresh: the new hold
+// starts before the old one ends, so the time never drops to zero between.
+- (void)holdBackgroundTimeForReport {
+  UIApplication *application = UIApplication.sharedApplication;
+  if (application.applicationState != UIApplicationStateBackground) {
+    return;
+  }
+  __weak LocationPlugin *weakSelf = self;
+  __block UIBackgroundTaskIdentifier hold = UIBackgroundTaskInvalid;
+  hold = [application
+      beginBackgroundTaskWithName:@"lyokone.location.report"
+                expirationHandler:^{
+                  [weakSelf endReportHold:hold];
+                }];
+  if (hold == UIBackgroundTaskInvalid) {
+    return;
+  }
+  UIBackgroundTaskIdentifier previous = self.reportHold;
+  self.reportHold = hold;
+  if (previous != UIBackgroundTaskInvalid) {
+    [application endBackgroundTask:previous];
+  }
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)(kReportHoldSeconds * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        [weakSelf endReportHold:hold];
+      });
+}
+
+// Ends [hold] when it is still the current one; a replaced hold was ended
+// when its successor began.
+- (void)endReportHold:(UIBackgroundTaskIdentifier)hold {
+  if (hold == UIBackgroundTaskInvalid || self.reportHold != hold) {
+    return;
+  }
+  self.reportHold = UIBackgroundTaskInvalid;
+  [UIApplication.sharedApplication endBackgroundTask:hold];
+}
+
+#pragma mark - AutoLNK fork: the background refresh (4.10)
+
+- (NSString *)refreshIdentifier {
+  NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
+  return bundle == nil ? nil : [bundle stringByAppendingString:kRefreshSuffix];
+}
+
+// Registers the refresh task's handler, once per process, and only when the
+// app lists the identifier: iOS throws for an identifier it does not list.
+- (void)registerRefreshTask {
+  if (@available(iOS 13.0, *)) {
+    if (refreshRegistered) {
+      return;
+    }
+    NSString *identifier = [self refreshIdentifier];
+    id permitted = [NSBundle.mainBundle
+        objectForInfoDictionaryKey:@"BGTaskSchedulerPermittedIdentifiers"];
+    if (identifier == nil || ![permitted isKindOfClass:[NSArray class]] ||
+        ![(NSArray *)permitted containsObject:identifier]) {
+      return;
+    }
+    refreshRegistered = YES;
+    __weak LocationPlugin *weakSelf = self;
+    [BGTaskScheduler.sharedScheduler
+        registerForTaskWithIdentifier:identifier
+                           usingQueue:dispatch_get_main_queue()
+                        launchHandler:^(__kindof BGTask *_Nonnull task) {
+                          LocationPlugin *strongSelf = weakSelf;
+                          if (strongSelf == nil) {
+                            [task setTaskCompletedWithSuccess:NO];
+                            return;
+                          }
+                          [strongSelf runRefreshTask:task];
+                        }];
+  }
+}
+
+// One run: the next request first (a run that iOS cuts short must not end
+// the chain), the alert, then Dart. A live engine that listens gets
+// onBackgroundRefresh at once. On a cold launch Dart takes the background
+// path (wasLaunchedByLocationEvent); its share start listens, which hands
+// the task over, and the start also completes the task when it ends.
+- (void)runRefreshTask:(BGTask *)task API_AVAILABLE(ios(13.0)) {
+  [self submitRefreshRequestAfter:kRefreshIntervalSeconds];
+  [self completeRefreshTask:YES];
+  self.refreshTask = task;
+  self.launchedForRefresh = YES;
+  __weak LocationPlugin *weakSelf = self;
+  __weak BGTask *weakTask = task;
+  task.expirationHandler = ^{
+    dispatch_async(dispatch_get_main_queue(), ^{
+      LocationPlugin *strongSelf = weakSelf;
+      if (strongSelf != nil && strongSelf.refreshTask == weakTask) {
+        [strongSelf completeRefreshTask:NO];
+      }
+    });
+  };
+  [self syncLocationAlert];
+  if (self.refreshListening) {
+    [self deliverRefreshToDart];
+  }
+}
+
+// Hands the pending task to Dart's refresh handler and completes it when
+// the handler answers. A handler that is gone answers "not implemented":
+// the task then waits for the expiry or for completeBackgroundRefresh.
+- (void)deliverRefreshToDart {
+  id task = self.refreshTask;
+  if (task == nil) {
+    return;
+  }
+  __weak LocationPlugin *weakSelf = self;
+  __weak id weakTask = task;
+  [self.channel
+      invokeMethod:@"onBackgroundRefresh"
+         arguments:nil
+            result:^(id _Nullable answer) {
+              if (answer == FlutterMethodNotImplemented ||
+                  [answer isKindOfClass:[FlutterError class]]) {
+                return;
+              }
+              LocationPlugin *strongSelf = weakSelf;
+              if (strongSelf != nil && strongSelf.refreshTask == weakTask) {
+                [strongSelf completeRefreshTask:YES];
+              }
+            }];
+}
+
+// Completes the pending refresh task; NO when none is pending.
+- (BOOL)completeRefreshTask:(BOOL)success {
+  if (@available(iOS 13.0, *)) {
+    BGTask *task = self.refreshTask;
+    if (task == nil) {
+      return NO;
+    }
+    self.refreshTask = nil;
+    [task setTaskCompletedWithSuccess:success];
+    return YES;
+  }
+  return NO;
+}
+
+- (BOOL)submitRefreshRequestAfter:(NSTimeInterval)delay
+    API_AVAILABLE(ios(13.0)) {
+  if (!refreshRegistered) {
+    return NO;
+  }
+  BGAppRefreshTaskRequest *request =
+      [[BGAppRefreshTaskRequest alloc] initWithIdentifier:[self refreshIdentifier]];
+  request.earliestBeginDate = [NSDate dateWithTimeIntervalSinceNow:delay];
+  NSError *error = nil;
+  if (![BGTaskScheduler.sharedScheduler submitTaskRequest:request
+                                                    error:&error]) {
+    // Background App Refresh off, Low Power Mode, or a simulator: no run.
+    NSLog(@"[Location] background refresh not scheduled: %@", error);
+    return NO;
+  }
+  return YES;
+}
+
+// Keeps one request pending. A request that already waits keeps its date,
+// so the frequent syncs of a live app never push the run out of reach.
+- (void)ensureRefreshScheduled:(FlutterResult)result {
+  if (@available(iOS 13.0, *)) {
+    if (!refreshRegistered) {
+      result(@0);
+      return;
+    }
+    [[NSUserDefaults standardUserDefaults] setBool:YES
+                                            forKey:kRefreshWantedKey];
+    NSString *identifier = [self refreshIdentifier];
+    __weak LocationPlugin *weakSelf = self;
+    [BGTaskScheduler.sharedScheduler getPendingTaskRequestsWithCompletionHandler:^(
+                                         NSArray<BGTaskRequest *> *requests) {
+      BOOL pending = NO;
+      for (BGTaskRequest *request in requests) {
+        if ([request.identifier isEqualToString:identifier]) {
+          pending = YES;
+          break;
+        }
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        LocationPlugin *strongSelf = weakSelf;
+        BOOL scheduled =
+            pending ||
+            (strongSelf != nil &&
+             [strongSelf submitRefreshRequestAfter:kRefreshIntervalSeconds]);
+        result(scheduled ? @1 : @0);
+      });
+    }];
+  } else {
+    result(@0);
+  }
+}
+
+- (void)cancelRefresh {
+  [[NSUserDefaults standardUserDefaults] removeObjectForKey:kRefreshWantedKey];
+  if (@available(iOS 13.0, *)) {
+    if (refreshRegistered) {
+      [BGTaskScheduler.sharedScheduler
+          cancelTaskRequestWithIdentifier:[self refreshIdentifier]];
+    }
+  }
 }
 #endif
 

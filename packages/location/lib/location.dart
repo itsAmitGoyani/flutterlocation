@@ -240,6 +240,8 @@ class Location implements LocationPlatform {
 
   static Future<void> Function(Map<String, Object?> wake)? _wakeHandler;
   static Future<void> Function()? _locationLaunchHandler;
+  static Future<void> Function()? _backgroundRefreshHandler;
+  static Future<void> Function()? _authorizationChangeHandler;
 
   /// Android only. Makes this engine's Dart side the one that takes the
   /// system wakes: `kind` is `drive`, `leash`, `activity`, `heartbeat`,
@@ -270,8 +272,62 @@ class Location implements LocationPlatform {
     _syncPlatformCallHandler();
   }
 
+  /// iOS only. Runs [handler] when iOS runs the app's background refresh
+  /// task (`<bundle id>.location-refresh`) in this process; the task
+  /// completes when [handler] completes. A task that came before this call
+  /// (a run that launched the process) runs at this call.
+  /// [wasLaunchedByLocationEvent] answers true for such a launch, so the
+  /// app takes its background path; the app may also complete the task
+  /// with [completeBackgroundRefresh]. Null stops listening.
+  Future<bool> setBackgroundRefreshHandler(
+    Future<void> Function()? handler,
+  ) {
+    _backgroundRefreshHandler = handler;
+    _syncPlatformCallHandler();
+    // The plugin hands over a task that came before this call.
+    return _invokeFlag(
+      'listenForBackgroundRefresh',
+      <String, Object?>{'listen': handler != null},
+    );
+  }
+
+  /// iOS only. Keeps one background refresh request pending, at least
+  /// [kRefreshInterval] ahead; a request that already waits keeps its date.
+  /// The app must list `<bundle id>.location-refresh` in
+  /// `BGTaskSchedulerPermittedIdentifiers`. False when iOS takes no request:
+  /// Background App Refresh off, Low Power Mode, a simulator, or Android.
+  Future<bool> scheduleBackgroundRefresh() {
+    return _invokeFlag('scheduleBackgroundRefresh');
+  }
+
+  /// iOS only. Drops the pending background refresh request.
+  Future<bool> cancelBackgroundRefresh() {
+    return _invokeFlag('cancelBackgroundRefresh');
+  }
+
+  /// iOS only. Completes the refresh task that launched this process, once
+  /// the app's background run is done. False when no task is pending.
+  Future<bool> completeBackgroundRefresh() {
+    return _invokeFlag('completeBackgroundRefresh');
+  }
+
+  /// iOS only. Runs [handler] at every authorization change the plugin
+  /// hears of: a grant or a location switch that changed, delivered in the
+  /// background too, where the app has no other way to learn of it. Null
+  /// stops listening.
+  void setAuthorizationChangeHandler(Future<void> Function()? handler) {
+    _authorizationChangeHandler = handler;
+    _syncPlatformCallHandler();
+  }
+
+  /// The earliest delay iOS gets for the next background refresh run.
+  static const Duration kRefreshInterval = Duration(minutes: 10);
+
   static void _syncPlatformCallHandler() {
-    final bool any = _wakeHandler != null || _locationLaunchHandler != null;
+    final bool any = _wakeHandler != null ||
+        _locationLaunchHandler != null ||
+        _backgroundRefreshHandler != null ||
+        _authorizationChangeHandler != null;
     _forkChannel.setMethodCallHandler(any ? _onPlatformCall : null);
   }
 
@@ -296,6 +352,20 @@ class Location implements LocationPlatform {
         }
         await handler();
         return 1;
+      case 'onBackgroundRefresh':
+        final Future<void> Function()? handler = _backgroundRefreshHandler;
+        if (handler == null) {
+          return 0;
+        }
+        await handler();
+        return 1;
+      case 'onAuthorizationChanged':
+        final Future<void> Function()? handler = _authorizationChangeHandler;
+        if (handler == null) {
+          return 0;
+        }
+        await handler();
+        return 1;
       default:
         throw MissingPluginException('No handler for ${call.method}');
     }
@@ -307,19 +377,26 @@ class Location implements LocationPlatform {
     return _invokeFlag('requestWake', <String, Object?>{'kind': kind});
   }
 
-  /// The app's localised words for the two location alerts the phone shows
-  /// its own user (Android, 4.10): the keys `channelName`,
-  /// `servicesOffTitle`, `servicesOffBody`, `permissionOffTitle`,
-  /// `permissionOffBody` and `iconName`. The plugin keeps them for the runs
-  /// that have no Dart engine. iOS answers false and shows nothing.
+  /// The app's localised words for the location alerts the phone shows its
+  /// own user (4.10): the keys `channelName`, `servicesOffTitle`,
+  /// `servicesOffBody`, `permissionOffTitle`, `permissionOffBody` and
+  /// `iconName`. The plugin keeps them for the runs that have no Dart
+  /// engine. iOS uses the two `servicesOff` keys only.
   Future<bool> setLocationAlertCopy(Map<String, String?> copy) {
     return _invokeFlag('setLocationAlertCopy', <String, Object?>{...copy});
   }
 
-  /// Posts or cancels the location alerts by the phone's state (Android,
-  /// 4.10). [shareWanted] says whether the user belongs to a server that
-  /// wants the share; without it both alerts are cancelled. iOS answers
-  /// false and shows nothing.
+  /// Posts or cancels the location alerts by the phone's state (4.10).
+  /// [shareWanted] says whether the user belongs to a server that wants the
+  /// share; without it every alert is cancelled.
+  ///
+  /// Android: a services alert for the location switch and a permission
+  /// alert for a grant below "Allow all the time". iOS, after Life360: one
+  /// time-sensitive alert, worded as the services alert, while the switch
+  /// is off or the grant is "Never"; none for "While Using" or reduced
+  /// accuracy. Both platforms post once per cause and remove the alert when
+  /// its cause goes, and the plugin also syncs by itself at each grant or
+  /// switch change it hears of.
   Future<bool> syncLocationAlerts({required bool shareWanted}) {
     return _invokeFlag(
       'syncLocationAlerts',
@@ -329,9 +406,10 @@ class Location implements LocationPlatform {
 
   /// iOS only. True when the system launched this process for a location
   /// event: the launch key (hosts without UIScene), a location event the
-  /// plugin already received, or a launch into the background with the
-  /// relaunch monitors armed and no scene. The app then runs in the
-  /// background with no UI and should start its location work itself.
+  /// plugin already received, a launch into the background with the
+  /// relaunch monitors armed and no scene, or the background refresh task
+  /// (4.10). The app then runs in the background with no UI and should
+  /// start its location work itself.
   Future<bool> wasLaunchedByLocationEvent() {
     return _invokeFlag('wasLaunchedByLocationEvent');
   }
