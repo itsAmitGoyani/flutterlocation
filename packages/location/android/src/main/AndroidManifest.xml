@@ -20,6 +20,16 @@
             android:exported="false"
             android:foregroundServiceType="location"
             android:name=".FlutterLocationFixService"/>
+        <!-- The resident watch of a sharing member's phone (4.10): a started
+             service with no notification that keeps the process alive, so
+             the location switch receiver hears a flip at once and the grant
+             is read at each start. Not stopped with the task: onTaskRemoved
+             schedules the job that brings it back. -->
+        <service
+            android:enabled="true"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:name=".LocationWatchService"/>
         <!-- The wake sources at rest: the leash geofence, the activity
              transitions and the heartbeat alarm (WakeMonitor). -->
         <receiver

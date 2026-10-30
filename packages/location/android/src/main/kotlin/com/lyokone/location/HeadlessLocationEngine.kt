@@ -17,8 +17,11 @@ import io.flutter.view.FlutterCallbackInformation
  * One engine per process, whoever asks for it: the service during a drive
  * ([FlutterLocationService]), or the wake hub for a short run at rest
  * ([WakeHub]). The engine lives until its Dart side ends the run
- * ([finish]), the app opens ([destroyNow]), or its Dart side never makes a
- * call ([DART_START_LIMIT_MS]). Main thread only.
+ * ([finish]), the app opens ([destroyNow]), its Dart side never makes a
+ * call ([DART_START_LIMIT_MS]), or no wake came for [IDLE_END_MS] after the
+ * hub drained its queue ([endWhenIdle]): a process the watch service keeps
+ * alive would otherwise keep the engine, and its timers, for good. Main
+ * thread only.
  */
 object HeadlessLocationEngine {
     private const val TAG = "HeadlessLocationEngine"
@@ -30,6 +33,13 @@ object HeadlessLocationEngine {
      * every wake would wait for it.
      */
     private const val DART_START_LIMIT_MS = 90_000L
+
+    /**
+     * How long a finished engine waits for the next wake before it ends.
+     * The Dart side's run is over when the hub drains (its upload flush is
+     * inside the run), so a minute covers a wake that follows at once.
+     */
+    private const val IDLE_END_MS = 60_000L
 
     /**
      * The app adds to a headless engine what its own engine gets from the
@@ -57,9 +67,31 @@ object HeadlessLocationEngine {
             }
         }
 
+    private val idleEnd =
+        Runnable {
+            if (current == null) return@Runnable
+            // A drive's engine belongs to the drive service, which ends it.
+            if (FlutterLocationService.isForegroundNow()) return@Runnable
+            Log.i(TAG, "No wake for ${IDLE_END_MS / 1000} s: ending the headless engine.")
+            finish()
+        }
+
     @JvmStatic
     val isRunning: Boolean
         get() = current != null
+
+    /** The hub drained its queue: the engine ends unless a wake comes in time. Any thread. */
+    @JvmStatic
+    fun endWhenIdle() {
+        main.removeCallbacks(idleEnd)
+        if (current != null) main.postDelayed(idleEnd, IDLE_END_MS)
+    }
+
+    /** A wake is queued: the engine stays for it. Any thread. */
+    @JvmStatic
+    fun keepForWake() {
+        main.removeCallbacks(idleEnd)
+    }
 
     /** Whether [candidate] is the plugin instance of the headless engine. */
     @JvmStatic
@@ -119,6 +151,7 @@ object HeadlessLocationEngine {
         plugin = null
         dartStarted = false
         main.removeCallbacks(dartStartCheck)
+        main.removeCallbacks(idleEnd)
     }
 
     /**

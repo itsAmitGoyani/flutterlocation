@@ -24,8 +24,10 @@ import androidx.core.content.ContextCompat
  * English is the fallback.
  *
  * [sync] is idempotent: it posts an alert whose cause holds and cancels one
- * whose cause went, so every caller may run it on every event. An alert
- * re-posted with the same cause makes no new sound.
+ * whose cause went, so every caller may run it on every event. An alert is
+ * posted once per cause (a persisted flag per id): the many syncs of one
+ * event make one notification, and a user who swiped it away is not told
+ * again until the cause went and came back.
  */
 object LocationAlert {
     private const val TAG = "LocationAlert"
@@ -39,6 +41,7 @@ object LocationAlert {
     private const val KEY_PERMISSION_TITLE = "alert_permission_off_title"
     private const val KEY_PERMISSION_BODY = "alert_permission_off_body"
     private const val KEY_ICON_NAME = "alert_icon_name"
+    private const val KEY_POSTED_PREFIX = "alert_posted_"
     private const val DEFAULT_CHANNEL_NAME = "Location alerts"
     private const val DEFAULT_SERVICES_TITLE = "Location services are off"
     private const val DEFAULT_SERVICES_BODY =
@@ -111,10 +114,14 @@ object LocationAlert {
         bodyDefault: String,
     ) {
         val manager = NotificationManagerCompat.from(app)
+        val p = prefs(app)
+        val postedKey = KEY_POSTED_PREFIX + id
         if (!wanted) {
             manager.cancel(id)
+            if (p.contains(postedKey)) p.edit().remove(postedKey).apply()
             return
         }
+        if (p.getBoolean(postedKey, false)) return
         if (!manager.areNotificationsEnabled()) return
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -122,7 +129,6 @@ object LocationAlert {
             return
         }
         ensureChannel(app, manager)
-        val p = prefs(app)
         val title = p.getString(titleKey, null) ?: titleDefault
         val body = p.getString(bodyKey, null) ?: bodyDefault
         val builder =
@@ -138,6 +144,7 @@ object LocationAlert {
         launchIntent(app)?.let { builder.setContentIntent(it) }
         try {
             manager.notify(id, builder.build())
+            p.edit().putBoolean(postedKey, true).apply()
             Log.i(TAG, "Alert $id posted.")
         } catch (e: SecurityException) {
             Log.w(TAG, "The alert could not be posted.", e)

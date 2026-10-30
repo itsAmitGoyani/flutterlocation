@@ -132,6 +132,7 @@ internal object WakeHub {
             while (queue.length() > MAX_QUEUE) queue.remove(0)
             writeQueue(app, queue)
         }
+        HeadlessLocationEngine.keepForWake()
         // One line per wake, readable in a release build. Never a position.
         val accuracy = (wake["accuracy"] as? Number)?.toInt()
         Log.i(TAG, "Wake ${wake["kind"]} queued" + if (accuracy != null) " with a fix of $accuracy m." else ".")
@@ -205,6 +206,9 @@ internal object WakeHub {
         val next = synchronized(lock) { firstOf(pruneStale(context)) }
         if (next == null) {
             finishWaiters()
+            // A resident process (LocationWatchService) would keep a finished
+            // headless engine, and its timers, alive for good.
+            HeadlessLocationEngine.endWhenIdle()
             return
         }
         val target = listener

@@ -164,10 +164,13 @@ internal object WakeMonitor {
 
     /**
      * The background grant went while the sources were armed (4.10): the
-     * leash, the transitions and the at-rest fixes go, because nothing may
-     * read a position now, but the arm flag and the heartbeat stay. The
-     * heartbeat is the watch for the grant's return: its receiver sees the
-     * grant come back and arms everything again. Idempotent.
+     * leash and the at-rest fixes go, because nothing may read a position
+     * now, but the arm flag, the heartbeat and the transitions stay. They
+     * are the watch for the grant's return: the transitions need only the
+     * Motion permission and wake the app within seconds of a move, the
+     * heartbeat is the floor, and the receiver of either sees the grant come
+     * back and arms everything again. The watch service stays too.
+     * Idempotent.
      */
     @JvmStatic
     fun onGrantLost(context: Context) {
@@ -180,7 +183,6 @@ internal object WakeMonitor {
         } catch (e: Exception) {
             Log.w(TAG, "The leash geofence could not be removed.", e)
         }
-        removeTransitions(app)
         removeAtRestFixes(app)
     }
 
@@ -241,6 +243,7 @@ internal object WakeMonitor {
         scheduleHeartbeat(app)
         // An install updated from 4.01 may still hold its at-rest request.
         removeAtRestFixes(app)
+        LocationWatchService.startIfWanted(app)
         return true
     }
 
@@ -250,10 +253,13 @@ internal object WakeMonitor {
         val app = context.applicationContext
         if (!isArmed(app)) return
         if (!FlutterLocationService.hasBackgroundLocationPermission(app)) {
-            // The grant went (4.10): keep the heartbeat as a watch for its
-            // return, so the user's repair re-arms everything by itself.
+            // The grant went (4.10): keep the heartbeat, the transitions and
+            // the watch service as the watch for its return, so the user's
+            // repair re-arms everything by itself.
             onGrantLost(app)
+            armTransitions(app)
             scheduleHeartbeat(app)
+            LocationWatchService.startIfWanted(app)
             return
         }
         onGrantBack(app)
@@ -261,11 +267,13 @@ internal object WakeMonitor {
         armTransitions(app)
         scheduleHeartbeat(app)
         removeAtRestFixes(app)
+        LocationWatchService.startIfWanted(app)
     }
 
     @JvmStatic
     fun disarm(context: Context) {
         val app = context.applicationContext
+        LocationWatchService.stop(app)
         val p = prefs(app)
         if (!p.getBoolean(KEY_ARMED, false) && !p.contains(KEY_LEASH_LAT)) return
         p.edit().putBoolean(KEY_ARMED, false).putBoolean(KEY_LEASH_OK, false).remove(KEY_LEASH_LAT).remove(KEY_LEASH_LNG).remove(KEY_GRANT_LOST).remove(KEY_GRANT_LOST_REPORTED).apply()
