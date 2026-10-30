@@ -12,6 +12,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequest
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 
 /**
@@ -91,13 +92,17 @@ class LocationWatchService : Service() {
             }
         }
 
+        /**
+         * Expedited on Android 12+, like the wake jobs ([WakeHub]): a plain
+         * job waited 92 s on MIUI, until another event had started the
+         * process. Below Android 12 an expedited job needs a foreground
+         * service and its notification, so the job stays plain there.
+         */
         private fun scheduleRestart(app: Context) {
             try {
-                WorkManager.getInstance(app).enqueueUniqueWork(
-                    RESTART_WORK,
-                    ExistingWorkPolicy.REPLACE,
-                    OneTimeWorkRequest.Builder(WatchRestartWorker::class.java).build(),
-                )
+                val builder = OneTimeWorkRequest.Builder(WatchRestartWorker::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                WorkManager.getInstance(app).enqueueUniqueWork(RESTART_WORK, ExistingWorkPolicy.REPLACE, builder.build())
             } catch (e: Exception) {
                 Log.w(TAG, "The restart job could not be scheduled.", e)
             }
