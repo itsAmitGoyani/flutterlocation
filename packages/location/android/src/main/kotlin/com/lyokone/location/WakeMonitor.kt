@@ -63,6 +63,8 @@ internal object WakeMonitor {
     private const val KEY_LEASH_LAT = "wake_leash_lat"
     private const val KEY_LEASH_LNG = "wake_leash_lng"
     private const val KEY_LEASH_OK = "wake_leash_ok"
+    private const val KEY_GRANT_LOST = "wake_grant_lost"
+    private const val KEY_GRANT_LOST_REPORTED = "wake_grant_lost_reported"
     private const val KEY_LAST_RECENTRE = "wake_leash_recentred_at"
 
     private const val LEASH_ID = "lyokone.location.leash"
@@ -161,6 +163,46 @@ internal object WakeMonitor {
     }
 
     /**
+     * The background grant went while the sources were armed (4.10): the
+     * leash, the transitions and the at-rest fixes go, because nothing may
+     * read a position now, but the arm flag and the heartbeat stay. The
+     * heartbeat is the watch for the grant's return: its receiver sees the
+     * grant come back and arms everything again. Idempotent.
+     */
+    @JvmStatic
+    fun onGrantLost(context: Context) {
+        val app = context.applicationContext
+        val p = prefs(app)
+        if (p.getBoolean(KEY_GRANT_LOST, false)) return
+        p.edit().putBoolean(KEY_GRANT_LOST, true).putBoolean(KEY_LEASH_OK, false).apply()
+        try {
+            LocationServices.getGeofencingClient(app).removeGeofences(listOf(LEASH_ID))
+        } catch (e: Exception) {
+            Log.w(TAG, "The leash geofence could not be removed.", e)
+        }
+        removeTransitions(app)
+        removeAtRestFixes(app)
+    }
+
+    @JvmStatic
+    fun isGrantLost(context: Context): Boolean = prefs(context).getBoolean(KEY_GRANT_LOST, false)
+
+    /** True once per loss: the one wake that lets Dart report the loss. */
+    @JvmStatic
+    fun claimGrantLostReport(context: Context): Boolean {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_GRANT_LOST_REPORTED, false)) return false
+        p.edit().putBoolean(KEY_GRANT_LOST_REPORTED, true).apply()
+        return true
+    }
+
+    /** The grant is back: the loss is history. */
+    @JvmStatic
+    fun onGrantBack(context: Context) {
+        prefs(context).edit().remove(KEY_GRANT_LOST).remove(KEY_GRANT_LOST_REPORTED).apply()
+    }
+
+    /**
      * Arms every source, or disarms them all. Idempotent: an armed call
      * registers everything again, because a grant may have changed. A
      * [latitude] and [longitude] put the leash on the spot where the app goes
@@ -208,9 +250,13 @@ internal object WakeMonitor {
         val app = context.applicationContext
         if (!isArmed(app)) return
         if (!FlutterLocationService.hasBackgroundLocationPermission(app)) {
-            disarm(app)
+            // The grant went (4.10): keep the heartbeat as a watch for its
+            // return, so the user's repair re-arms everything by itself.
+            onGrantLost(app)
+            scheduleHeartbeat(app)
             return
         }
+        onGrantBack(app)
         armLeash(app)
         armTransitions(app)
         scheduleHeartbeat(app)
@@ -222,7 +268,7 @@ internal object WakeMonitor {
         val app = context.applicationContext
         val p = prefs(app)
         if (!p.getBoolean(KEY_ARMED, false) && !p.contains(KEY_LEASH_LAT)) return
-        p.edit().putBoolean(KEY_ARMED, false).putBoolean(KEY_LEASH_OK, false).remove(KEY_LEASH_LAT).remove(KEY_LEASH_LNG).apply()
+        p.edit().putBoolean(KEY_ARMED, false).putBoolean(KEY_LEASH_OK, false).remove(KEY_LEASH_LAT).remove(KEY_LEASH_LNG).remove(KEY_GRANT_LOST).remove(KEY_GRANT_LOST_REPORTED).apply()
         try {
             LocationServices.getGeofencingClient(app).removeGeofences(listOf(LEASH_ID))
         } catch (e: Exception) {

@@ -8,6 +8,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.location.LocationManager
+import android.content.IntentFilter
+import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -440,6 +443,13 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
     // Service is foreground
     private var isForeground = false
 
+    // The location switch (4.10): while this process lives, a flip of the
+    // switch reaches the user and Dart at once. The broadcast is implicit,
+    // so only a live receiver gets it; a dead app learns it at its next
+    // wake (WakeReceiver).
+    private var providersReceiver: BroadcastReceiver? = null
+    private var servicesWereEnabled: Boolean? = null
+
     private var activity: Activity? = null
 
     private var backgroundNotification: BackgroundNotification? = null
@@ -510,6 +520,41 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
         NotificationOptions.fromJson(prefs.getString(PREFS_KEY_NOTIFICATION, null))?.let {
             backgroundNotification?.updateOptions(it, false)
         }
+        registerProvidersReceiver()
+    }
+
+    private fun registerProvidersReceiver() {
+        if (providersReceiver != null) return
+        val receiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context,
+                    intent: Intent,
+                ) {
+                    onProvidersChanged(context.applicationContext)
+                }
+            }
+        val filter = IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION)
+        filter.addAction(LocationManager.MODE_CHANGED_ACTION)
+        if (Build.VERSION.SDK_INT >= 33) {
+            applicationContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            applicationContext.registerReceiver(receiver, filter)
+        }
+        providersReceiver = receiver
+        servicesWereEnabled = LocationAlert.servicesEnabled(applicationContext)
+    }
+
+    private fun onProvidersChanged(app: Context) {
+        val enabled = LocationAlert.servicesEnabled(app)
+        if (servicesWereEnabled == enabled) return
+        servicesWereEnabled = enabled
+        Log.i(TAG, "Location services " + (if (enabled) "on." else "off."))
+        if (!WakeMonitor.isArmed(app)) return
+        LocationAlert.sync(app, shareWanted = true)
+        // Dart reads the switch and reports it to the viewers
+        // (LocationWakeHandler, kind `services`).
+        WakeHub.enqueue(app, mapOf("kind" to "services", "ts" to System.currentTimeMillis().toDouble()))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -540,6 +585,14 @@ class FlutterLocationService : Service(), PluginRegistry.RequestPermissionsResul
     override fun onDestroy() {
         Log.d(TAG, "Destroying service.")
         instance = null
+        providersReceiver?.let {
+            try {
+                applicationContext.unregisterReceiver(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "The providers receiver was not registered.", e)
+            }
+        }
+        providersReceiver = null
         cancelDartCheck()
         mainHandler.removeCallbacks(probeEnd)
         HeadlessLocationEngine.destroyNow()

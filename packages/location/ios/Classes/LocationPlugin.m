@@ -310,7 +310,9 @@ static const NSTimeInterval kOneShotAccuracySeconds = 30.0;
   } else if ([call.method isEqualToString:@"listenForWakes"] ||
              [call.method isEqualToString:@"stopListeningForWakes"] ||
              [call.method isEqualToString:@"requestWake"] ||
-             [call.method isEqualToString:@"finishHeadlessRun"]) {
+             [call.method isEqualToString:@"finishHeadlessRun"] ||
+             [call.method isEqualToString:@"setLocationAlertCopy"] ||
+             [call.method isEqualToString:@"syncLocationAlerts"]) {
     // Android only: iOS relaunches the whole app and streams from Dart.
     result(@0);
   } else if ([call.method isEqualToString:@"getCurrentFix"]) {

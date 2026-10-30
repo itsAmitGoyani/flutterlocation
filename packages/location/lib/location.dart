@@ -307,6 +307,26 @@ class Location implements LocationPlatform {
     return _invokeFlag('requestWake', <String, Object?>{'kind': kind});
   }
 
+  /// The app's localised words for the two location alerts the phone shows
+  /// its own user (Android, 4.10): the keys `channelName`,
+  /// `servicesOffTitle`, `servicesOffBody`, `permissionOffTitle`,
+  /// `permissionOffBody` and `iconName`. The plugin keeps them for the runs
+  /// that have no Dart engine. iOS answers false and shows nothing.
+  Future<bool> setLocationAlertCopy(Map<String, String?> copy) {
+    return _invokeFlag('setLocationAlertCopy', <String, Object?>{...copy});
+  }
+
+  /// Posts or cancels the location alerts by the phone's state (Android,
+  /// 4.10). [shareWanted] says whether the user belongs to a server that
+  /// wants the share; without it both alerts are cancelled. iOS answers
+  /// false and shows nothing.
+  Future<bool> syncLocationAlerts({required bool shareWanted}) {
+    return _invokeFlag(
+      'syncLocationAlerts',
+      <String, Object?>{'shareWanted': shareWanted},
+    );
+  }
+
   /// iOS only. True when the system launched this process for a location
   /// event: the launch key (hosts without UIScene), a location event the
   /// plugin already received, or a launch into the background with the

@@ -36,12 +36,6 @@ class WakeReceiver : BroadcastReceiver() {
     ) {
         val app = context.applicationContext
         if (!WakeMonitor.isArmed(app)) return
-        if (!FlutterLocationService.hasBackgroundLocationPermission(app)) {
-            // The grant went while the app was dead: nothing may wake it now.
-            Log.d(TAG, "The background location grant is gone: disarming the wake sources.")
-            WakeMonitor.disarm(app)
-            return
-        }
         // The job write happens on WorkManager's thread; the broadcast's
         // wake lock must last until then.
         val pending = goAsync()
@@ -51,6 +45,33 @@ class WakeReceiver : BroadcastReceiver() {
             if (finished.compareAndSet(false, true)) pending.finish()
         }
         main.postDelayed({ finish() }, ASYNC_LIMIT_MS)
+        if (!FlutterLocationService.hasBackgroundLocationPermission(app)) {
+            // The grant went while the app was dead (4.10): tell the user at
+            // once, keep the heartbeat as a watch for the grant's return,
+            // and let Dart report the loss to the viewers once.
+            Log.d(TAG, "The background location grant is gone: keeping the heartbeat as a watch.")
+            WakeMonitor.onGrantLost(app)
+            if (intent.action == WakeMonitor.ACTION_HEARTBEAT) WakeMonitor.scheduleHeartbeat(app)
+            LocationAlert.sync(app, shareWanted = true)
+            if (WakeMonitor.claimGrantLostReport(app)) {
+                WakeHub.enqueue(app, mapOf("kind" to "grant_lost", "ts" to now()), finish)
+            } else {
+                finish()
+            }
+            return
+        }
+        if (WakeMonitor.isGrantLost(app)) {
+            // The user gave the grant back (4.10): every source again, and
+            // one wake so Dart starts the share and reports the repair.
+            Log.d(TAG, "The background location grant is back: arming the wake sources again.")
+            WakeMonitor.rearmIfArmed(app)
+            LocationAlert.sync(app, shareWanted = true)
+            WakeHub.enqueue(app, mapOf("kind" to "grant_back", "ts" to now()), finish)
+            return
+        }
+        // The location switch (4.10): the alert follows the phone's state at
+        // every wake event, so a dead app tells its user at its next wake.
+        LocationAlert.sync(app, shareWanted = true)
         try {
             when (intent.action) {
                 WakeMonitor.ACTION_HEARTBEAT -> onHeartbeat(app, finish)

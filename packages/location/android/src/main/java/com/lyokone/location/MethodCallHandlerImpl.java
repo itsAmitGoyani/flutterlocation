@@ -98,6 +98,17 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
         }
     }
 
+    private static Map<String, String> alertCopyOf(Object arguments) {
+        Map<String, String> copy = new HashMap<>();
+        if (arguments instanceof Map) {
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) arguments).entrySet()) {
+                Object value = entry.getValue();
+                copy.put(String.valueOf(entry.getKey()), value == null ? null : value.toString());
+            }
+        }
+        return copy;
+    }
+
     @Override
     public void onMethodCall(MethodCall call, Result result) {
         // Any call proves that a headless engine's Dart side started.
@@ -124,6 +135,16 @@ final class MethodCallHandlerImpl implements MethodCallHandler {
                 return;
             case "isBackgroundPermissionGranted":
                 result.success(FlutterLocationService.hasBackgroundLocationPermission(context) ? 1 : 0);
+                return;
+            case "setLocationAlertCopy":
+                // The app's localised words for the two location alerts (4.10).
+                LocationAlert.setCopy(context, alertCopyOf(call.arguments));
+                result.success(1);
+                return;
+            case "syncLocationAlerts":
+                // Post or cancel the alerts by the phone's state (4.10).
+                LocationAlert.sync(context, Boolean.TRUE.equals(call.argument("shareWanted")));
+                result.success(1);
                 return;
             case "setRelaunchMonitoring":
                 onSetRelaunchMonitoring(call, result);
